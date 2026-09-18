@@ -14,6 +14,10 @@ Shader "Hidden/FluidSSFR"
     Properties
     {
         _MainTex ("Fields (R=depth, G=thickness, B=alpha)", 2D) = "black" {}
+        _FoamTex ("Foam density (R, screen space, FoamLayer)", 2D) = "black" {}
+        _FoamOn ("Foam on", Float) = 0
+        _FoamK ("Foam coverage k (1-exp(-k D))", Float) = 0.8
+        _FoamColor ("Foam color", Color) = (0.96, 0.98, 1.0, 1)
     }
     SubShader
     {
@@ -79,7 +83,18 @@ Shader "Hidden/FluidSSFR"
 
             sampler2D _MainTex;
             float4 _MainTex_TexelSize;
+            sampler2D _FoamTex;
+            float _FoamOn, _FoamK;
+            float3 _FoamColor;
             float _Focal, _KThick, _RefrStrength, _F0, _Shininess, _Ks, _FrMax;
+
+            // 059 whitewater layer: density -> coverage, lerp towards the foam colour (before gamma).
+            float3 foamOver(float3 c, float2 uv)
+            {
+                if (_FoamOn < 0.5) return c;
+                float fa = 1.0 - exp(-_FoamK * tex2D(_FoamTex, uv).r);
+                return lerp(c, _FoamColor, saturate(fa));
+            }
             float3 _AbsorbSigma, _LightDir, _SkyTop, _SkyHor, _FloorA, _FloorB, _BodyTint, _SpecTint;
 
             // Sky gradient above a horizon at 52% height, perspective checker floor below
@@ -122,7 +137,7 @@ Shader "Hidden/FluidSSFR"
                 float3 bg = background(i.uv);
                 if (f.b < 0.5)
                 {
-                    float3 bgc = bg;
+                    float3 bgc = foamOver(bg, i.uv);
                     #if !defined(UNITY_COLORSPACE_GAMMA)
                     bgc = GammaToLinearSpace(bgc);
                     #endif
@@ -171,7 +186,7 @@ Shader "Hidden/FluidSSFR"
                 float3 spec = _Ks * pow(saturate(dot(N, Hh)), _Shininess) * _SpecTint;
 
                 float3 surface = refr * (1.0 - Fr) + refl * Fr + spec;
-                float3 outc = saturate(surface);
+                float3 outc = foamOver(saturate(surface), i.uv);
                 // The reference pipeline's colors are display-ready (sRGB); in a Linear-space
                 // project convert so the displayed/encoded value matches the reference exactly.
                 #if !defined(UNITY_COLORSPACE_GAMMA)

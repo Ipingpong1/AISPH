@@ -174,6 +174,26 @@ public class FluidLiveMVP : MonoBehaviour
     [Tooltip("Parity-dump mode only: which Sim Slot to dump (index into Sim Slots).")]
     public int paritySlot = 0;
 
+    [Header("Foam / whitewater (059 compositor layer, key F)")]
+    [Tooltip("Draw Ihmsen-style spray/foam/bubbles generated from the coarse particle frame (FoamLayer.cs, the in-engine port of the 059 probe) over every panel. Pure compositor: no network output involved; the layer is depth-tested against each panel's own fluid depth. Toggle at runtime with F.")]
+    public bool foamEnabled = false;
+    [Tooltip("Spawn rate multiplier (the probe's mass factor). Higher = more whitewater. Recommended default: 30.")]
+    public float foamSpawnScale = 30f;
+    [Tooltip("Per-particle disk footprint scale (fraction of the projected coarse radius). 0 = single pixel (the probe's look). Recommended default: 1.")]
+    public float foamSpriteScale = 1f;
+    [Tooltip("Trapped-air / wave-crest spawn constants per second per unit potential (probe defaults 8 / 12).")]
+    public float foamKTa = 8f, foamKWc = 12f;
+    [Tooltip("Multiplier on the running potential calibration. Lower = potentials saturate sooner = more, earlier foam. Recommended default: 1.")]
+    public float foamTauScale = 1f;
+    [Tooltip("Coverage constant: alpha = 1 - exp(-k * density). Recommended default: 2.")]
+    public float foamCoverageK = 2.0f;
+    [Tooltip("Cap on live diffuse particles; the oldest are dropped past it. CPU cost scales with this. Recommended default: 40000.")]
+    public int foamMaxDiffuse = 40000;
+    [Tooltip("Whitewater colour (sRGB, composited before the shader's gamma conversion).")]
+    public Color foamColor = new Color(0.96f, 0.98f, 1f, 1f);
+    [Tooltip("Gravity for ballistic spray / buoyant bubbles, sim units. Dam sims use (0,-9.81,0); tilted-gravity bakes differ slightly.")]
+    public Vector3 foamGravity = new Vector3(0f, -9.81f, 0f);
+
     [Header("Playback")]
     [Tooltip("Simulation playback rate in frames/sec. Higher = the baked sequence advances faster (more motion per real second); lower = slower motion. Recommended default: 25.")]
     public float playbackFps = 25f;
@@ -257,6 +277,10 @@ public class FluidLiveMVP : MonoBehaviour
     const float SigmaPx = 2f;
     bool useV2;                                      // resolved per slot in LoadSim
     float v2Radius, v2ThickScale, v2MinR = 1f, v2MaxR = 24f;
+    FoamLayer foam;                                  // 059 whitewater layer (CPU)
+    Texture2D foamTexNet, foamTexRaw;                // RFloat, texture rows (row 0 = bottom)
+    float[] foamDenNet, foamDenRaw, foamTmp, foamStage, rawDepthCHW;
+    float lastSimTime; int lastFrameIdx = -1;
 
     // Everything one model needs to go from the shared input tensor to its own shaded panel.
     // The shading resources are per-model (not shared/reused) so all panels stay live at once.
@@ -272,6 +296,7 @@ public class FluidLiveMVP : MonoBehaviour
         public float kThick;
         public bool kThickLocked;
         public float inferMs;
+        public float[] depthCHW;                             // predicted front depth, world units, 0 = bg (foam depth test)
     }
 
     IParticleFrameSource src;
@@ -323,6 +348,11 @@ public class FluidLiveMVP : MonoBehaviour
         denBuf = new float[HW];
         in7 = new float[7 * HW];
         rawPx = new Color[HW];
+        foam = new FoamLayer();
+        foamDenNet = new float[HW]; foamDenRaw = new float[HW]; foamTmp = new float[HW]; foamStage = new float[HW];
+        rawDepthCHW = new float[HW];
+        foamTexNet = new Texture2D(W, H, TextureFormat.RFloat, false) { filterMode = FilterMode.Bilinear };
+        foamTexRaw = new Texture2D(W, H, TextureFormat.RFloat, false) { filterMode = FilterMode.Bilinear };
 
         if (parityDump) { RunParityDump(); return; }
 
@@ -586,6 +616,18 @@ public class FluidLiveMVP : MonoBehaviour
         SplatToInput(frameIdx, in cam);
         if (showRawSideBySide) FillRawFieldTex();
 
+        // 059 whitewater: advance the diffuse particles in this frame's coarse field (sim time, not wall time)
+        if (foamEnabled)
+        {
+            if (frameIdx < lastFrameIdx || simTime < lastSimTime) foam.Reset();      // playback looped / restarted
+            float fdt = Mathf.Clamp(simTime - lastSimTime, 0f, 0.2f);
+            foam.kTa = foamKTa; foam.kWc = foamKWc; foam.spawnScale = foamSpawnScale; foam.tauScale = foamTauScale;
+            foam.maxDiffuse = Mathf.Max(foamMaxDiffuse, 1000); foam.gravity = foamGravity; foam.spriteScale = foamSpriteScale;
+            src.GetFrame(frameIdx, out var fdata, out int foff, out int fcount);
+            foam.Step(fdata, foff, fcount, FoamRadius(), fdt);
+        }
+        lastSimTime = simTime; lastFrameIdx = frameIdx;
+
         foreach (var pan in panels)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -644,10 +686,28 @@ public class FluidLiveMVP : MonoBehaviour
         }
         mat.SetFloat("_BlurSigma", bilateralSmoothing ? bilateralSigmaS : presmoothSigma);
 
+        // foam density maps: one for the primary model's depth, one for the raw input's depth
+        mat.SetFloat("_FoamOn", foamEnabled ? 1f : 0f);
+        mat.SetFloat("_FoamK", foamCoverageK);
+        mat.SetVector("_FoamColor", new Vector4(foamColor.r, foamColor.g, foamColor.b, 0f));
+        if (foamEnabled)
+        {
+            float focalF = 1f / Mathf.Tan(fovDeg * Mathf.Deg2Rad / 2f);
+            foam.Splat(cam.eye, cam.right, cam.trueUp, cam.fwd, focalF, H, W, panels[0].depthCHW, FoamRadius(), foamDenNet, foamTmp);
+            UploadFoam(foamTexNet, foamDenNet);
+            if (showRawSideBySide)
+            {
+                for (int i = 0; i < HW; i++) rawDepthCHW[i] = thickBuf[i] > 0f ? depthBuf[i] : 0f;
+                foam.Splat(cam.eye, cam.right, cam.trueUp, cam.fwd, focalF, H, W, rawDepthCHW, FoamRadius(), foamDenRaw, foamTmp);
+                UploadFoam(foamTexRaw, foamDenRaw);
+            }
+        }
+
         // identical smoothing+shading chain for every model; only the adaptive bilateral range
         // sigma is per-panel (same formula, each panel's own depth stats)
         foreach (var pan in panels)
         {
+            mat.SetTexture("_FoamTex", foamTexNet);
             mat.SetFloat("_KThick", pan.kThick);
             mat.SetFloat("_BilateralRangeSigma", bilateralSmoothing ? pan.bilateralSigmaR : 0f);
             Graphics.Blit(pan.fieldTex, pan.smoothedRT, mat, 0);
@@ -663,6 +723,7 @@ public class FluidLiveMVP : MonoBehaviour
         if (showRawSideBySide)
         {
             // same chain again on the raw input fields, at the primary model's thickness scale
+            mat.SetTexture("_FoamTex", foamTexRaw);
             mat.SetFloat("_KThick", panels[0].kThick);
             mat.SetFloat("_BilateralRangeSigma", bilateralSmoothing ? rawBilateralSigmaR : 0f);
             Graphics.Blit(rawFieldTex, rawSmoothedRT, mat, 0);
@@ -703,7 +764,19 @@ public class FluidLiveMVP : MonoBehaviour
                  $"frame {frameIdx + 1}/{src.FrameCount}   sim {playbackFps:F0} fps ×{speed:F1}   " +
                  $"render {smoothedFps:F1} fps   infer {infer} ms   backend={backend}   splat={(useV2 ? "v2" : "legacy")}   " +
                  $"k_thick={panels[0].kThick:F3}{(bilateralSmoothing ? $"   BILATERAL σs={bilateralSigmaS:F0}×{bilateralIters} σr={panels[0].bilateralSigmaR:F3}" : "")}" +
+                 $"{(foamEnabled ? $"   FOAM {foam.Alive} ({foam.Spray}s/{foam.Foam}f/{foam.Bubble}b) +{foam.SpawnedTa}/{foam.SpawnedWc} {foam.LastStepMs + 2f * foam.LastSplatMs:F1} ms" : "")}" +
                  $"{(paused ? "   PAUSED" : "")}{(orbit ? "   ORBIT" : "")}";
+    }
+
+    // world radius the foam layer uses for its support (4 r) and spawn cylinder: the slot's coarse radius
+    float FoamRadius() => useV2 ? v2Radius : (meta != null && meta.coarseRadius > 0f ? meta.coarseRadius : 0.0414f);
+
+    void UploadFoam(Texture2D tex, float[] denCHW)
+    {
+        for (int y = 0; y < H; y++)
+            Array.Copy(denCHW, y * W, foamStage, (H - 1 - y) * W, W);   // tensor row 0 = top; texture row 0 = bottom
+        tex.SetPixelData(foamStage, 0);
+        tex.Apply(false, false);
     }
 
     // SSFRViewer pred semantics: ch6 = occupancy logit (>0 fluid), denorm depth/thickness, row flip.
@@ -714,6 +787,7 @@ public class FluidLiveMVP : MonoBehaviour
         double dSum = 0.0, dSumSq = 0.0;   // fg depth stats for the reference bilateral's adaptive sigma_r
         int fgCount = 0;
         var px = pan.px;
+        if (pan.depthCHW == null) pan.depthCHW = new float[HW];
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++)
             {
@@ -723,6 +797,7 @@ public class FluidLiveMVP : MonoBehaviour
                 float depth = a > 0f ? pred[i] * ds + dm : 0f;
                 float thick = a > 0f ? Mathf.Max(pred[HW + i] * ts + tm, 0f) : 0f;
                 px[flipped] = new Color(depth, thick, a, 1f);
+                pan.depthCHW[i] = depth;
                 if (a > 0f) { dSum += depth; dSumSq += (double)depth * depth; fgCount++; }
             }
         // sigma_r = max(0.12 * std(fg depth), 1e-3), unbiased std like torch.std() (n-1).
@@ -785,6 +860,7 @@ public class FluidLiveMVP : MonoBehaviour
 
         if (kb != null)
         {
+            if (kb.fKey.wasPressedThisFrame) { foamEnabled = !foamEnabled; if (foamEnabled) foam.Reset(); }
             if (kb.oKey.wasPressedThisFrame)
             {
                 orbit = !orbit;
@@ -852,7 +928,7 @@ public class FluidLiveMVP : MonoBehaviour
         if (!capturing)
             GUI.Label(new Rect(10, Screen.height - 24, 1600, 22),
                 "WASD/QE fly (Shift fast)   RMB look   O orbit   B bilateral   V raw panel   " +
-                "1-9 sim slot   P pause   R restart   [ ] sim fps");
+                "1-9 sim slot   P pause   R restart   [ ] sim fps   F foam");
     }
 
     void DrawPanel(int col, float colW, RenderTexture rt, string label)
@@ -872,6 +948,8 @@ public class FluidLiveMVP : MonoBehaviour
             if (pan.shadedRT != null) pan.shadedRT.Release();
         }
         if (rawFieldTex != null) Destroy(rawFieldTex);
+        if (foamTexNet != null) Destroy(foamTexNet);
+        if (foamTexRaw != null) Destroy(foamTexRaw);
         if (rawSmoothedRT != null) rawSmoothedRT.Release();
         if (rawSmoothedRT2 != null) rawSmoothedRT2.Release();
         if (rawShadedRT != null) rawShadedRT.Release();

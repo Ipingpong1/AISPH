@@ -1028,10 +1028,10 @@ MonoBehaviour:
   particleData: {fileID: 4900000, guid: ab97afebaa9e923ee82f334cb23c0fbc, type: 3}
   metaJson: {fileID: 4900000, guid: 6444aa6a08d826a008bac915303d83c1, type: 3}
   simSlots:
-  - label: Dam Break (true low-res SPH)
+  - label: Dam Break (2k)
     particleData: {fileID: 4900000, guid: ab97afebaa9e923ee82f334cb23c0fbc, type: 3}
     metaJson: {fileID: 4900000, guid: 6444aa6a08d826a008bac915303d83c1, type: 3}
-  - label: Dam-Bulk (1.5k)
+  - label: Dam-Settle (2.7k)
     particleData: {fileID: 4900000, guid: 6eac3e80d2b26637d8187b24bf95cad1, type: 3}
     metaJson: {fileID: 4900000, guid: 2541e0b0d59637947923637bb86ca28c, type: 3}
   - label: emitter lowres 4 (dam-density, ~1.3k splats)
@@ -1040,7 +1040,7 @@ MonoBehaviour:
   - label: Top-Down Emitter
     particleData: {fileID: 4900000, guid: 022caa46d5a5081eaadd9109e965ccad, type: 3}
     metaJson: {fileID: 4900000, guid: 5243548e2c9c4fb0b95ba5558816a9de, type: 3}
-  - label: emitter lowres 1 (true low-res SPH)
+  - label: ide Emitter
     particleData: {fileID: 4900000, guid: f030de3dcf4548cea71eec00e2a215a8, type: 3}
     metaJson: {fileID: 4900000, guid: d60a75988ceb4b71b56e590c1e5f96f7, type: 3}
   - label: emitter lowres 2 (true low-res SPH)
@@ -1055,6 +1055,16 @@ MonoBehaviour:
   ssfrShader: {fileID: 4800000, guid: e1e62df4560715f1390cbde41a0243cc, type: 3}
   splatMode: 0
   paritySlot: 0
+  foamEnabled: 1
+  foamSpawnScale: 20
+  foamSpriteScale: 1
+  foamKTa: 8
+  foamKWc: 12
+  foamTauScale: 1
+  foamCoverageK: 0.8
+  foamMaxDiffuse: 30000
+  foamColor: {r: 0.96, g: 0.98, b: 1, a: 1}
+  foamGravity: {x: 0, y: -9.81, z: 0}
   playbackFps: 25
   speed: 1
   fovDeg: 49.88038
@@ -1065,10 +1075,10 @@ MonoBehaviour:
   orbitDistance: 4.905532
   backend: 256
   useFp16: 0
-  kThickOverride: 0
+  kThickOverride: 0.4
   showRawSideBySide: 1
   shareKThickAcrossModels: 1
-  presmoothSigma: 2
+  presmoothSigma: 1
   bilateralSmoothing: 0
   bilateralSigmaS: 2
   bilateralIters: 1
