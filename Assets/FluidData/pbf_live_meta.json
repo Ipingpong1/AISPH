@@ -1,0 +1,35 @@
+{
+  "source": "GpuPbfV1 own-root stats (Datasets/gpupbf_v1_pysurfgt/stats.pt) \u2014 for models trained with them (053a)",
+  "fps": 25,
+  "frameCount": 1,
+  "factor": 1,
+  "target": [
+    1.5,
+    1.0,
+    1.5
+  ],
+  "mean": [
+    3.9971752166748047,
+    3.557262420654297,
+    0.09330568462610245,
+    -0.3202972412109375,
+    0.021217498928308487,
+    592.2565307617188
+  ],
+  "std": [
+    1.003770112991333,
+    4.792604923248291,
+    1.2333719730377197,
+    1.4804322719573975,
+    1.3122771978378296,
+    223.4121856689453
+  ],
+  "height": 512,
+  "width": 512,
+  "splatRadiusPx": 5,
+  "sigmaPx": 2.0,
+  "renderer": "v2",
+  "thicknessScale": 3.9448387491412222,
+  "minRadiusPx": 1.0,
+  "maxRadiusPx": 24.0
+}

@@ -1,0 +1,363 @@
+// GpuSph.compute — GPU port of LiveSphProvider.cs (PBF, Macklin & Müller 2013).
+//
+// The C# solver is the ORACLE: kernels, constants, and phase structure are ported 1:1 —
+// cubic spline with support h = 4·particleRadius, sigma = 8/(π h³), mass = 0.8·(2r)³·ρ0,
+// identical spatial-hash constants and power-of-two table, Jacobi phases (all lambdas from
+// pred[], then all deltas from pred[]+lambda[], then apply+clamp+obstacle SDFs), velocity
+// from position delta, XSPH on final velocities against the substep-start grid (the same
+// staleness the C# neighbor cache has). Deliberate differences, recorded:
+//   - no 96-neighbor cap (the C# MaxNbr truncation; at rest ~34 neighbors, cap rarely binds)
+//   - neighbor iteration order differs (GPU) -> float sums differ in the last bits; parity
+//     with the oracle is bounded-drift + distributional, never bitwise (see GpuSph_VALIDATION.md)
+//   - gravity is a uniform (runner.py randomizes magnitude/tilt); C# hardcodes (0,-9.81,0)
+//
+// PARTICLE ORDER IS STABLE (spawn order; no reordering ever). The training pipeline's LR
+// subsample is `ids % factor == 0` on export order, so a stable order makes the LR subset a
+// PERSISTENT, initially-uniform sub-lattice of particles — temporally coherent by construction.
+// (SPlisHSPlasH gets spatial coherence from periodic z-sort instead; do not "optimize" this
+// solver with a particle sort without revisiting that contract — see unity_sim_to_bgeo.py.)
+
+#pragma kernel Integrate
+#pragma kernel ClearGrid
+#pragma kernel BuildGrid
+#pragma kernel ComputeLambda
+#pragma kernel ComputeDelta
+#pragma kernel ApplyDelta
+#pragma kernel FinalizeVelocity
+#pragma kernel XsphAccum
+#pragma kernel XsphApply
+#pragma kernel VmaxReduce
+#pragma kernel ObstacleProjectTest   // validation gate only — never dispatched by GpuSphSolver.Step
+
+#define GROUP 256
+
+cbuffer Params
+{
+    uint   _N;             // active particles
+    uint   _TableSize;     // power of two
+    uint   _NumObstacles;
+    float  _Dt;
+    float  _H;             // support radius = 4r
+    float  _H2;
+    float  _Mass;
+    float  _KernelSigma;   // 8/(pi h^3)
+    float  _InvRho0;
+    float  _LambdaEps;
+    float  _SCorrK;
+    float  _InvSCorrDenom; // 1/W(0.2h), 0 if sCorr disabled
+    float  _Xsph;
+    float  _VelClamp;      // hard |v| cap after the velocity update (0 = off). The reference
+                           // DFSPH data never exceeds ~9 m/s in this domain; PBF correction
+                           // spikes (v = dx/dt) reached 42 m/s even with _DpClamp. Cap above
+                           // the physical envelope = tails cleaned, dynamics untouched.
+    float  _DpClamp;       // max |dp| per solver iteration (0 = off). Standard PBD stabilizer:
+                           // caps the position-correction a single iteration can apply, which is
+                           // what turns into a velocity spike via v=(dx)/dt at impact frames.
+                           // Found 2026-08-19: dense-class solves spiked to 40-4000 m/s without it.
+    float3 _Gravity;
+    float3 _DomainMin;     // already inset by particleRadius (wall clamp)
+    float3 _DomainMax;
+}
+
+RWStructuredBuffer<float3> _Pos;
+RWStructuredBuffer<float3> _Vel;
+RWStructuredBuffer<float3> _Pred;
+RWStructuredBuffer<float3> _Dp;       // per-iteration position delta; XSPH scratch
+RWStructuredBuffer<float>  _Dens;
+RWStructuredBuffer<float>  _Lambda;
+RWStructuredBuffer<int>    _Head;     // per-cell linked-list head (same layout as C#)
+RWStructuredBuffer<int>    _Next;
+RWStructuredBuffer<uint>   _VmaxBits; // [0] = asuint(max |v|^2), atomic-max'd
+StructuredBuffer<float3>   _TestIn;   // ObstacleProjectTest only (validation gate)
+RWStructuredBuffer<float3> _TestOut;
+
+// Transforms are stored as EXPLICIT ROWS, not float4x4. Matrix packing inside a structured
+// buffer is a backend convention (HLSL defaults to column-major; Unity's Matrix4x4 is stored
+// column-major too), and getting it wrong is SILENT: on 2026-08-20 the gate found that the
+// previous float4x4 + `.transpose` upload made every obstacle a no-op on the GPU — the solver
+// moved 0 of the 267 particles the C# oracle moved, with no error anywhere. Rows + dot products
+// mean exactly one interpretation on every backend. Stride is unchanged (8*16 + 4 + 4 + 8 = 144).
+struct ObstacleGpu
+{
+    float4 t0, t1, t2, t3;   // toLocal   rows: sim -> obstacle local (unit primitives, extent 0.5)
+    float4 f0, f1, f2, f3;   // fromLocal rows: obstacle local -> sim
+    int shape;               // 0 = sphere, 1 = box, 2 = torus (matches LiveSphProvider.Obstacle.Shape)
+    int active;
+    float2 _pad;
+};
+StructuredBuffer<ObstacleGpu> _Obstacles;
+
+float3 XformPoint(float4 r0, float4 r1, float4 r2, float4 r3, float3 p)
+{
+    float4 v = float4(p, 1.0);
+    return float3(dot(r0, v), dot(r1, v), dot(r2, v));
+}
+
+// Torus: axis +Y, centre circle radius TORUS_MAJOR, tube radius TORUS_TUBE. MAJOR+TUBE = 0.5
+// keeps the "unit primitive fits the 0.5 half-extent" rule every other shape follows, so a
+// transform scale s still means world outer DIAMETER s; the 2:1 ratio mirrors SPlisHSPlasH's
+// torus.obj so the shape matches the DFSPH obstacle corpus. MUST stay in sync with
+// TorusMajor / TorusTube in LiveSphProvider — the C# side is the parity oracle.
+#define TORUS_MAJOR (1.0 / 3.0)
+#define TORUS_TUBE  (1.0 / 6.0)
+
+// Push a point out of every active obstacle, in that obstacle's local space. Shared by
+// ApplyDelta and the ObstacleProjectTest gate kernel so there is exactly ONE implementation
+// on the GPU side to keep in parity with LiveSphProvider.CollideObstacles.
+float3 ProjectOutOfObstacles(float3 p)
+{
+    for (uint o = 0; o < _NumObstacles; o++)
+    {
+        ObstacleGpu ob = _Obstacles[o];
+        if (ob.active == 0) continue;
+        float3 lp = XformPoint(ob.t0, ob.t1, ob.t2, ob.t3, p);
+        if (ob.shape == 0)
+        {
+            float r = length(lp);
+            if (r < 0.5)
+            {
+                lp = r > 1e-5 ? lp * (0.5 / r) : float3(0.0, 0.5, 0.0);
+                p = XformPoint(ob.f0, ob.f1, ob.f2, ob.f3, lp);
+            }
+        }
+        else if (ob.shape == 1)
+        {
+            if (abs(lp.x) < 0.5 && abs(lp.y) < 0.5 && abs(lp.z) < 0.5)
+            {
+                // NB: C# Mathf.Sign(0) == 1, HLSL sign(0) == 0 — use explicit compares for parity
+                float px = 0.5 - abs(lp.x), py = 0.5 - abs(lp.y), pz = 0.5 - abs(lp.z);
+                if (px <= py && px <= pz)      lp.x = lp.x >= 0.0 ? 0.5 : -0.5;
+                else if (py <= pz)             lp.y = lp.y >= 0.0 ? 0.5 : -0.5;
+                else                           lp.z = lp.z >= 0.0 ? 0.5 : -0.5;
+                p = XformPoint(ob.f0, ob.f1, ob.f2, ob.f3, lp);
+            }
+        }
+        else
+        {
+            // Torus: nearest point on the tube surface. Work in the (radial, y) half-plane,
+            // where the tube is a circle of radius TORUS_TUBE centred at (TORUS_MAJOR, 0).
+            float rad = length(lp.xz);
+            float2 d = float2(rad - TORUS_MAJOR, lp.y);
+            float dl = length(d);
+            if (dl < TORUS_TUBE)
+            {
+                // degenerate (exactly on the centre circle): push radially outward, matching C#
+                d = dl > 1e-5 ? d * (TORUS_TUBE / dl) : float2(TORUS_TUBE, 0.0);
+                float nr = TORUS_MAJOR + d.x;
+                // on-axis fallback is defensive only: MAJOR > TUBE means rad ~ 0 is never inside
+                float2 dir = rad > 1e-5 ? lp.xz / rad : float2(1.0, 0.0);
+                lp = float3(dir.x * nr, d.y, dir.y * nr);
+                p = XformPoint(ob.f0, ob.f1, ob.f2, ob.f3, lp);
+            }
+        }
+    }
+    return p;
+}
+
+// ---------------------------------------------------------------- kernel functions (1:1 port)
+
+float W(float r)
+{
+    float q = r / _H;
+    if (q >= 1.0) return 0.0;
+    if (q <= 0.5) { float q2 = q * q; return _KernelSigma * (6.0 * (q2 * q - q2) + 1.0); }
+    float t = 1.0 - q;
+    return _KernelSigma * 2.0 * t * t * t;
+}
+
+float dW(float r)
+{
+    float q = r / _H;
+    if (q >= 1.0 || q < 1e-6) return 0.0;
+    if (q <= 0.5) return _KernelSigma * (6.0 / _H) * (3.0 * q * q - 2.0 * q);
+    float t = 1.0 - q;
+    return -_KernelSigma * (6.0 / _H) * t * t;
+}
+
+// ---------------------------------------------------------------- spatial hash (same constants)
+
+int3 CellOf(float3 p)
+{
+    return (int3)floor(p / _H);
+}
+
+uint HashCell(int3 c)
+{
+    int hsh = c.x * 73856093 ^ c.y * 19349663 ^ c.z * 83492791;
+    return (uint)hsh & (_TableSize - 1u);
+}
+
+// ---------------------------------------------------------------- kernels
+
+[numthreads(GROUP, 1, 1)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N) return;
+    float3 v = _Vel[i] + _Gravity * _Dt;
+    _Vel[i] = v;
+    _Pred[i] = _Pos[i] + v * _Dt;
+}
+
+[numthreads(GROUP, 1, 1)]
+void ClearGrid(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _TableSize) _Head[id.x] = -1;
+}
+
+[numthreads(GROUP, 1, 1)]
+void BuildGrid(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N) return;
+    uint hc = HashCell(CellOf(_Pred[i]));
+    int prev;
+    InterlockedExchange(_Head[hc], (int)i, prev);
+    _Next[i] = prev;
+}
+
+#define FOREACH_NEIGHBOR(pi, BODY)                                              \
+    {                                                                           \
+        int3 cc = CellOf(pi);                                                   \
+        for (int dz = -1; dz <= 1; dz++)                                        \
+        for (int dy = -1; dy <= 1; dy++)                                        \
+        for (int dx = -1; dx <= 1; dx++)                                        \
+        {                                                                       \
+            uint hc = HashCell(cc + int3(dx, dy, dz));                          \
+            for (int j = _Head[hc]; j != -1; j = _Next[j])                      \
+            {                                                                   \
+                if ((uint)j == i) continue;                                     \
+                BODY                                                            \
+            }                                                                   \
+        }                                                                       \
+    }
+
+[numthreads(GROUP, 1, 1)]
+void ComputeLambda(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N) return;
+    float3 pi = _Pred[i];
+    float rho = _Mass * _KernelSigma;             // mass * W(0)
+    float3 gradI = 0;
+    float sumGrad2 = 0;
+    FOREACH_NEIGHBOR(pi,
+    {
+        float3 d = pi - _Pred[j];
+        float r = length(d);
+        if (r < _H)
+        {
+            rho += _Mass * W(r);
+            float3 grad = (_Mass * _InvRho0 * dW(r) / max(r, 1e-6)) * d;
+            gradI += grad;
+            sumGrad2 += dot(grad, grad);
+        }
+    })
+    _Dens[i] = rho;
+    float C = rho * _InvRho0 - 1.0;
+    _Lambda[i] = C > 0.0 ? -C / (sumGrad2 + dot(gradI, gradI) + _LambdaEps) : 0.0;
+}
+
+[numthreads(GROUP, 1, 1)]
+void ComputeDelta(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N) return;
+    float3 pi = _Pred[i];
+    float li = _Lambda[i];
+    float3 delta = 0;
+    FOREACH_NEIGHBOR(pi,
+    {
+        float3 d = pi - _Pred[j];
+        float r = length(d);
+        if (r < _H)
+        {
+            float sCorr = 0.0;
+            if (_SCorrK > 0.0 && _InvSCorrDenom > 0.0)
+            {
+                float w = W(r) * _InvSCorrDenom;
+                sCorr = -_SCorrK * w * w * w * w;
+            }
+            delta += ((li + _Lambda[j] + sCorr) * _Mass * _InvRho0 * dW(r) / max(r, 1e-6)) * d;
+        }
+    })
+    if (_DpClamp > 0.0)
+    {
+        float dl = length(delta);
+        if (dl > _DpClamp) delta *= _DpClamp / dl;
+    }
+    _Dp[i] = delta;
+}
+
+[numthreads(GROUP, 1, 1)]
+void ApplyDelta(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N) return;
+    float3 p = _Pred[i] + _Dp[i];
+    p = clamp(p, _DomainMin, _DomainMax);
+    p = ProjectOutOfObstacles(p);
+    _Pred[i] = p;
+}
+
+// Validation-only: run the obstacle projection on arbitrary points so the editor can compare it
+// against LiveSphProvider.CollideObstacles on the SAME point set (GpuSph_VALIDATION.md §4).
+// Dispatched with _N = point count and the obstacle buffer already uploaded; never used by Step.
+[numthreads(GROUP, 1, 1)]
+void ObstacleProjectTest(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N) return;
+    _TestOut[i] = ProjectOutOfObstacles(_TestIn[i]);
+}
+
+[numthreads(GROUP, 1, 1)]
+void FinalizeVelocity(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N) return;
+    float3 p = _Pred[i];
+    float3 v = (p - _Pos[i]) / _Dt;
+    if (_VelClamp > 0.0)
+    {
+        float vl = length(v);
+        if (vl > _VelClamp) v *= _VelClamp / vl;
+    }
+    _Vel[i] = v;
+    _Pos[i] = p;
+}
+
+[numthreads(GROUP, 1, 1)]
+void XsphAccum(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N) return;
+    float3 pi = _Pos[i];
+    float3 vi = _Vel[i];
+    float3 acc = 0;
+    FOREACH_NEIGHBOR(pi,
+    {
+        float r = length(pi - _Pos[j]);
+        if (r < _H)
+            acc += (_Vel[j] - vi) * (_Mass / max(_Dens[j], 1.0) * W(r));
+    })
+    _Dp[i] = acc;   // scratch, applied in XsphApply (Jacobi: reads _Vel, writes after barrier)
+}
+
+[numthreads(GROUP, 1, 1)]
+void XsphApply(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N) return;
+    _Vel[i] += _Xsph * _Dp[i];
+}
+
+[numthreads(GROUP, 1, 1)]
+void VmaxReduce(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N) return;
+    float3 v = _Vel[i];
+    // |v|^2 is non-negative -> its IEEE bits are monotone -> uint InterlockedMax is a float max
+    InterlockedMax(_VmaxBits[0], asuint(dot(v, v)));
+}

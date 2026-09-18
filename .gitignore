@@ -1,0 +1,86 @@
+# Unity generated folders
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+UserSettings/
+MemoryCaptures/
+
+# Visual Studio / JetBrains
+.vs/
+.vscode/
+.idea/
+*.csproj
+*.sln
+*.slnx
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local captures/exports/backups
+Captures/
+FrameData/
+FrameData_*/
+ParityDump/
+_backup_*/
+
+# Large simulation exports (many files exceed GitHub non-LFS limits)
+SimExport/**/*.bytes
+
+# Crash dumps
+*.blob
+
+# ONNX policy:
+# 1) Ignore all ONNX assets and their metas by default.
+# 2) Re-include only model_*.onnx files with iteration >= 50.
+# 3) Keep oversized files ignored for GitHub non-LFS constraints.
+Assets/*.onnx
+Assets/*.onnx.meta
+
+# Allowed ONNX models by iteration (50-99 and 100+)
+!Assets/model_0[5-9]*.onnx
+!Assets/model_0[5-9]*.onnx.meta
+!Assets/model_[1-9][0-9]*.onnx
+!Assets/model_[1-9][0-9]*.onnx.meta
+
+# Keep known oversized ONNX files ignored (>=100 MB, GitHub non-LFS limit)
+Assets/model_010.onnx
+Assets/model_010.onnx.meta
+Assets/model_014.onnx
+Assets/model_014.onnx.meta
+Assets/model_016.onnx
+Assets/model_016.onnx.meta
+Assets/model_017a.onnx
+Assets/model_017a.onnx.meta
+Assets/model_033a.onnx
+Assets/model_033a.onnx.meta
+Assets/model_033a_softswap.onnx
+Assets/model_033a_softswap.onnx.meta
+Assets/model_033a_softswap 1.onnx
+Assets/model_033a_softswap 1.onnx.meta
+
+# Additional known >100MB project files outside ignored Unity folders
+SimExport/GpuPbfV1/sim_0025.bytes
+
+# SSU restart 2026-09-18: large / regenerable artefacts stay out of the repo
+*.onnx
+*.onnx.meta
+ParityDump/
+FrameData*/
+Captures/
+SimExport/
+*.blob
+*.mp4
+Temp/

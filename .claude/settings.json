@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi)",
+      "Bash(nvidia-smi *)",
+      "Bash(conda activate *)",
+      "Bash(conda list *)",
+      "Bash(conda info *)"
+    ]
+  }
+}
