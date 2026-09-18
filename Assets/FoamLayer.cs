@@ -32,7 +32,7 @@ public sealed class FoamLayer
     public float kTa = 8f, kWc = 12f, spawnScale = 20f, tauScale = 1f;
     public float lifeMin = 1f, lifeMax = 4f;
     public float tauDecay = 0.98f;
-    public int maxDiffuse = 40000;
+    public int maxDiffuse = 30000;
     public float spriteScale = 1f;          // multiplier on the per-particle disk footprint (0 = single pixel)
     public Vector3 gravity = new Vector3(0f, -9.81f, 0f);
     public float floorY = -0.05f;

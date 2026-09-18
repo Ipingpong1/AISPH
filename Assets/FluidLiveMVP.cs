@@ -177,18 +177,18 @@ public class FluidLiveMVP : MonoBehaviour
     [Header("Foam / whitewater (059 compositor layer, key F)")]
     [Tooltip("Draw Ihmsen-style spray/foam/bubbles generated from the coarse particle frame (FoamLayer.cs, the in-engine port of the 059 probe) over every panel. Pure compositor: no network output involved; the layer is depth-tested against each panel's own fluid depth. Toggle at runtime with F.")]
     public bool foamEnabled = false;
-    [Tooltip("Spawn rate multiplier (the probe's mass factor). Higher = more whitewater. Recommended default: 30.")]
-    public float foamSpawnScale = 30f;
+    [Tooltip("Spawn rate multiplier (the probe's mass factor). Higher = more whitewater. Recommended default: 20 (the value the 09-18 captures used).")]
+    public float foamSpawnScale = 20f;
     [Tooltip("Per-particle disk footprint scale (fraction of the projected coarse radius). 0 = single pixel (the probe's look). Recommended default: 1.")]
     public float foamSpriteScale = 1f;
     [Tooltip("Trapped-air / wave-crest spawn constants per second per unit potential (probe defaults 8 / 12).")]
     public float foamKTa = 8f, foamKWc = 12f;
     [Tooltip("Multiplier on the running potential calibration. Lower = potentials saturate sooner = more, earlier foam. Recommended default: 1.")]
     public float foamTauScale = 1f;
-    [Tooltip("Coverage constant: alpha = 1 - exp(-k * density). Recommended default: 2.")]
-    public float foamCoverageK = 2.0f;
-    [Tooltip("Cap on live diffuse particles; the oldest are dropped past it. CPU cost scales with this. Recommended default: 40000.")]
-    public int foamMaxDiffuse = 40000;
+    [Tooltip("Coverage constant: alpha = 1 - exp(-k * density). Recommended default: 0.8 (with the disk footprints on).")]
+    public float foamCoverageK = 0.8f;
+    [Tooltip("Cap on live diffuse particles; the oldest are dropped past it. CPU cost scales with this. Recommended default: 30000.")]
+    public int foamMaxDiffuse = 30000;
     [Tooltip("Whitewater colour (sRGB, composited before the shader's gamma conversion).")]
     public Color foamColor = new Color(0.96f, 0.98f, 1f, 1f);
     [Tooltip("Gravity for ballistic spray / buoyant bubbles, sim units. Dam sims use (0,-9.81,0); tilted-gravity bakes differ slightly.")]
