@@ -76,6 +76,8 @@ public class SimExportRunner : MonoBehaviour
     public int maxParticlesCap = 524288;
     [Tooltip("CFL substep cap per 1/25s frame. 8 is fine for the coarse live class (r~0.041); the dense-GT class (r~0.009-0.016) VIOLATES CFL at 8 and gains unphysical energy — measured 2026-08-17, use 32 there.")]
     public int maxSubsteps = 8;
+    [Tooltip("DamBreak family: PBF constraint iterations per substep. 3 = the GpuPbfV1 corpus as shipped. Re-solving its 36 seeds at 20 (2026-09-21) does NOT raise its low median density (803 -> 744: splash content is kernel-deficient, not under-converged); what 3 iterations costs a dam break is a fast-particle tail (1.4 % -> 0.05 % above 6 m/s) and a splash ~40 % too high late in the clip.")]
+    public int damSolverIters = 3;
 
     public string OutDir => Path.Combine(Application.dataPath, "..", "SimExport", rootName);
 
@@ -140,6 +142,7 @@ public class SimExportRunner : MonoBehaviour
             domainMin = Vector3.zero,
             domainMax = Vector3.one * domainSize,
             maxSubsteps = maxSubsteps,
+            solverIters = damSolverIters,
         };
         solver.Init();
         // Clamp: obstacleStage has exactly MaxObstacles slots, and obstaclesMax is an inspector
