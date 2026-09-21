@@ -22,7 +22,7 @@ Shader "Hidden/FluidTemporal"
 
             sampler2D _MainTex, _FieldTex, _HistTex;
             float4 _HistTex_TexelSize;          // xy = 1/size, zw = size
-            float _HasHistory, _Reproject, _Hyst, _ARest, _V0, _V1, _RejectM, _WinAspect, _FocalC, _FocalP;
+            float _HasHistory, _Reproject, _Hyst, _ARest, _V0, _V1, _RejectM, _WinAspect, _FocalC, _FocalP, _DGate0, _DGate1;
             float3 _EyeC, _RightC, _UpC, _FwdC, _EyeP, _RightP, _UpP, _FwdP;
 
             float4 tapHist(float2 ip) { return tex2Dlod(_HistTex, float4((ip + 0.5) * _HistTex_TexelSize.xy, 0, 0)); }
@@ -73,7 +73,13 @@ Shader "Hidden/FluidTemporal"
                 bool agree = have && m && abs(Dh - c.r) <= _RejectM;
                 float speed = tex2D(_FieldTex, i.uv).a;
                 float t = saturate((speed - _V0) / max(_V1 - _V0, 1e-6));
-                float a = agree ? _ARest + (1.0 - _ARest) * t * t * (3.0 - 2.0 * t) : 1.0;
+                float a = _ARest + (1.0 - _ARest) * t * t * (3.0 - 2.0 * t);
+                if (_DGate1 > 0.0)
+                {   // cm-scale disagreement with the history = real motion, not flicker (mm-scale): trust the current frame
+                    float g = saturate((abs(Dh - c.r) - _DGate0) / max(_DGate1 - _DGate0, 1e-6));
+                    a = max(a, g * g * (3.0 - 2.0 * g));
+                }
+                if (!agree) a = 1.0;
                 float D = m ? a * c.r + (1.0 - a) * Dh : Dh;
                 float T = m ? a * c.g + (1.0 - a) * Th : Th;
 

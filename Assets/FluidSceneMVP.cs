@@ -145,6 +145,8 @@ public class FluidSceneMVP : MonoBehaviour
     [Tooltip("History is ignored where it disagrees with the current depth by more than this [sim m] (disocclusion).")]
     public float temporalRejectM = 0.10f;
     public bool temporalReproject = true;
+    [Tooltip("Depth gate (x, y) in sim metres: alpha also rises to 1 as |current depth - reprojected history| goes from x to y. (0, 0) = off (default). (0.01, 0.04) cut the ghost tail behind a 3.3 m/s stirrer from 34 to 9.5 mm (p90) offline with no loss of the calm-pool flicker gain, at a few points of the moving-camera gain.")]
+    public Vector2 temporalDepthGate = Vector2.zero;
     public bool temporalMaskHysteresis = true;
 
     [Header("Color / Look")]
@@ -265,7 +267,7 @@ public class FluidSceneMVP : MonoBehaviour
         public float v2R, v2TS, v2MinR, v2MaxR, thickScale, refLrParticleRadius, presmoothSigma, depthBias, simScale, kThick;
         public float[] mean, std, target, simOffset;
         public int winW, winH;
-        public string temporalMode; public float temporalAlphaRest, temporalV0, temporalV1, temporalRejectM; public bool temporalReproject, temporalMaskHysteresis;
+        public string temporalMode; public float temporalAlphaRest, temporalV0, temporalV1, temporalRejectM, temporalDGate0, temporalDGate1; public bool temporalReproject, temporalMaskHysteresis;
         public float inferMs;      // smoothed wall-clock ms of RunModel (Schedule + blocking readback) when the clip ended
     }
 
@@ -281,7 +283,7 @@ public class FluidSceneMVP : MonoBehaviour
         simOffset = new[] { simOffset.x, simOffset.y, simOffset.z },
         winW = W, winH = H, inferMs = inferMs,
         temporalMode = temporalMode.ToString(), temporalAlphaRest = temporalAlphaRest, temporalV0 = temporalSpeedRamp.x, temporalV1 = temporalSpeedRamp.y,
-        temporalRejectM = temporalRejectM, temporalReproject = temporalReproject, temporalMaskHysteresis = temporalMaskHysteresis,
+        temporalRejectM = temporalRejectM, temporalDGate0 = temporalDepthGate.x, temporalDGate1 = temporalDepthGate.y, temporalReproject = temporalReproject, temporalMaskHysteresis = temporalMaskHysteresis,
     };
 
     void Start()
@@ -691,6 +693,7 @@ public class FluidSceneMVP : MonoBehaviour
             temporalMat.SetFloat("_V0", temporalSpeedRamp.x);
             temporalMat.SetFloat("_V1", temporalSpeedRamp.y);
             temporalMat.SetFloat("_RejectM", temporalRejectM);
+            temporalMat.SetFloat("_DGate0", temporalDepthGate.x); temporalMat.SetFloat("_DGate1", temporalDepthGate.y);
             temporalMat.SetFloat("_WinAspect", winAspect);
             temporalMat.SetFloat("_FocalC", focalM); temporalMat.SetFloat("_FocalP", focalPrev);
             temporalMat.SetVector("_EyeC", eyeSim); temporalMat.SetVector("_RightC", rightSim); temporalMat.SetVector("_UpC", upSim); temporalMat.SetVector("_FwdC", fwdSim);
