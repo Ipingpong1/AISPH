@@ -476,8 +476,8 @@ GameObject:
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_StaticEditorFlags: 2147483647
+  m_IsActive: 1
 --- !u!114 &336920068
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -502,11 +502,11 @@ MonoBehaviour:
   backend: 256
   useFp16: 0
   kThickOverride: 0.13
-  thicknessCountNormalize: 1
+  thicknessCountNormalize: 0
   parityDumpPath: 
   refLrParticleRadius: 0.04302
   splatMode: 0
-  v2WorldRadius: 0
+  v2WorldRadius: 0.03
   v2ThicknessScale: 0
   presmoothSigma: 0
   bilateralSmoothing: 0
@@ -1011,8 +1011,8 @@ GameObject:
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
-  m_StaticEditorFlags: 2147483647
-  m_IsActive: 1
+  m_StaticEditorFlags: 0
+  m_IsActive: 0
 --- !u!114 &1184729738
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1055,7 +1055,7 @@ MonoBehaviour:
   ssfrShader: {fileID: 4800000, guid: e1e62df4560715f1390cbde41a0243cc, type: 3}
   splatMode: 0
   paritySlot: 0
-  foamEnabled: 1
+  foamEnabled: 0
   foamSpawnScale: 20
   foamSpriteScale: 1
   foamKTa: 8
