@@ -59,8 +59,8 @@ public class SimExportRunner : MonoBehaviour
     public int poolParticleCap = 200000;
     [Tooltip("Pool families: GpuSphSolver.wallDamp [1/s]. 0 reproduces the skating floor layer of the dense class.")]
     public float poolWallDamp = 0f;
-    [Tooltip("Pool families: PBF constraint iterations per substep. 3 (the live / dam-break value) UNDER-CONVERGES a resting 7-13 layer dense column: measured 2026-09-21, median density 800-850 instead of 1000 and a floor monolayer skating at 7-8 m/s (14 % of the fluid above 6 m/s) under calm water. 10 -> density 1000, 0.00 % above 6 m/s, and FEWER CFL substeps.")]
-    public int poolSolverIters = 10;
+    [Tooltip("Pool families: PBF constraint iterations per substep. 3 (the live / dam-break value) UNDER-CONVERGES a resting 7-13 layer dense column: measured 2026-09-21, median density 800-850 instead of 1000 and a floor monolayer skating at 7-8 m/s (14 % of the fluid above 6 m/s) under calm water. 10 fixes 27 of 30 pools (density 1000, 0.00 % above 6 m/s, FEWER CFL substeps); the 3 that stayed under-converged at 10 (density 674-740, vmax pinned at the cap all clip) converge at 20.")]
+    public int poolSolverIters = 20;
 
     [Header("Domain (training convention: [0,3]³)")]
     public float domainSize = 3f;
