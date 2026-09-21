@@ -1,5 +1,5 @@
 {
- "source": "GpuPbfV1 own-root stats (Datasets/gpupbf_v1_pysurfgt/stats.pt) \u2014 for models trained with them (053a)",
+ "source": "067a: union own-stats, train sims (Datasets/gpupbf_union_poolstir_v1/stats.pt) - pairs with model_067a_pbf_poolstir_v2lr",
  "fps": 25,
  "frameCount": 1,
  "factor": 1,

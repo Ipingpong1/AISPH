@@ -1,0 +1,36 @@
+{
+ "source": "067b: gpupbf_v1cam2 own-stats (Datasets/gpupbf_v1cam2_pysurfgt_lrv2/stats.pt) - pairs with model_067b_pbf_v1cam2_v2lr",
+ "fps": 25,
+ "frameCount": 1,
+ "factor": 1,
+ "target": [
+  1.5,
+  1.0,
+  1.5
+ ],
+ "mean": [
+  3.683915376663208,
+  3.1591012477874756,
+  0.13428831100463867,
+  -0.41865870356559753,
+  -0.17524269223213196,
+  614.4425048828125
+ ],
+ "std": [
+  1.2809267044067383,
+  4.692419052124023,
+  1.2593083381652832,
+  1.524397373199463,
+  1.2757383584976196,
+  217.08514404296875
+ ],
+ "height": 512,
+ "width": 512,
+ "splatRadiusPx": 5,
+ "sigmaPx": 2.0,
+ "renderer": "v2",
+ "thicknessScale": 3.9448387491412222,
+ "minRadiusPx": 1.0,
+ "maxRadiusPx": 24.0,
+ "coarseRadius": 0.0414
+}
