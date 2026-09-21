@@ -71,13 +71,14 @@ public class LiveClipRecorder : MonoBehaviour
         if (scene == null || provider == null) { Debug.LogError("[LiveClipRecorder] needs a FluidSceneMVP and a GpuSphProvider"); enabled = false; return; }
         provider.OnSolverFrame += HandleSolverFrame;
         scene.OnInferred += HandleInferred;
+        scene.OnShaded += HandleShaded;
         if (recordOnPlay) Begin();
     }
 
     void OnDisable()
     {
         if (provider != null) provider.OnSolverFrame -= HandleSolverFrame;
-        if (scene != null) scene.OnInferred -= HandleInferred;
+        if (scene != null) { scene.OnInferred -= HandleInferred; scene.OnShaded -= HandleShaded; }
         if (recording && fixedStep) Time.captureFramerate = prevCaptureFramerate;
         recording = false;
     }
@@ -136,8 +137,36 @@ public class LiveClipRecorder : MonoBehaviour
             WriteFloats(Path.Combine(dir, $"in7_f{k:D4}.bytes"), scene.LastInput);
             WriteFloats(Path.Combine(dir, $"pred_f{k:D4}.bytes"), scene.LastPred);
             dumped.Add(k);
+            pendingTemporalDump = k;
         }
-        if (recs.Count >= frames) Finish();
+        if (recs.Count >= frames) finishAfterShade = true;
+    }
+
+    int pendingTemporalDump = -1;
+    bool finishAfterShade;
+
+    // After the shading blits: the temporal stage's input / history / output for the frame just dumped (067-EMA3 shader-vs-mirror parity).
+    void HandleShaded()
+    {
+        if (pendingTemporalDump >= 0 && scene.TemporalOut != null)
+        {
+            string dir = OutDir(); int k = pendingTemporalDump;
+            DumpRT(Path.Combine(dir, $"tin_f{k:D4}.bytes"), scene.TemporalIn);
+            DumpRT(Path.Combine(dir, $"thist_f{k:D4}.bytes"), scene.TemporalHist);
+            DumpRT(Path.Combine(dir, $"tout_f{k:D4}.bytes"), scene.TemporalOut);
+        }
+        pendingTemporalDump = -1;
+        if (finishAfterShade) { finishAfterShade = false; Finish(); }
+    }
+
+    static void DumpRT(string path, RenderTexture rt)
+    {
+        var prev = RenderTexture.active; RenderTexture.active = rt;
+        var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGBAFloat, false, true);
+        tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0); tex.Apply(false);
+        RenderTexture.active = prev;
+        WriteFloats(path, tex.GetRawTextureData<float>().ToArray());
+        Destroy(tex);
     }
 
     string OutDir() => Path.GetFullPath(Path.Combine(Application.dataPath, "..", outRoot, clipName));

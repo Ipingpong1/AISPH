@@ -69,7 +69,7 @@ public class FluidSceneMVP : MonoBehaviour
     public float speed = 1f;
 
     [Header("Inference")]
-    [Tooltip("Inference Engine backend. GPUPixel + fp32 is the validated config (GPUCompute is silently wrong for these models). Recommended default: GPUPixel.")]
+    [Tooltip("Inference Engine backend. 2026-09-21 (067, ledger A4): GPUCompute fp32 AND GPUPixel fp32 both match onnxruntime on 053a / 060a / 058c and the wide models (max |d| < 1e-3, identical occupancy mask) on Inference Engine 2.6.1 — the older 'GPUCompute is silently wrong' warning no longer holds for these models.")]
     public BackendType backend = BackendType.GPUPixel;
     [Tooltip("Attempt fp16 weight quantization (auto-falls back to fp32 on failure). Recommended default: true.")]
     public bool useFp16 = true;
@@ -133,6 +133,19 @@ public class FluidSceneMVP : MonoBehaviour
     public float shininess = 120f;
     [Tooltip("World-units slack added to the scene-depth occlusion test in the composite (clip(sceneEye - fluidDepth + bias)). 0 = today's unbiased test, which z-fights wherever the fluid lies on scene geometry (the pool on the Ground plane).")]
     public float depthBias = 0f;
+
+    public enum TemporalMode { Off, Adaptive }
+    [Header("Temporal (067-EMA3) — off by default")]
+    [Tooltip("Adaptive = a temporal stage between the presmooth and the shading: the history is reprojected through the camera motion, depth/thickness get an EMA whose alpha rises to 1 where the INPUT's own speed channel says the fluid moves, and the occupancy mask gets hysteresis. Offline on frozen live clips (067): static camera -41..-43 % normal flicker after sigma 2 and -40..-45 % silhouette crawl with <= 0.5 cm ghosts; orbiting camera -50..-59 % frame-to-frame normal change (only -19..-53 % without the reprojection). Mirror + known-answer gate: SSU_restart/Helpers/live_gap_temporal.py.")]
+    public TemporalMode temporalMode = TemporalMode.Off;
+    [Tooltip("EMA alpha where the fluid is at rest (memory ~ 1/alpha frames). 1 = no smoothing.")]
+    [Range(0.05f, 1f)] public float temporalAlphaRest = 0.3f;
+    [Tooltip("Input speed [m/s] below which alpha = Alpha Rest / above which alpha = 1 (smoothstep between).")]
+    public Vector2 temporalSpeedRamp = new Vector2(0.1f, 0.5f);
+    [Tooltip("History is ignored where it disagrees with the current depth by more than this [sim m] (disocclusion).")]
+    public float temporalRejectM = 0.10f;
+    public bool temporalReproject = true;
+    public bool temporalMaskHysteresis = true;
 
     [Header("Color / Look")]
     [Tooltip("Blood look (see FluidLiveMVP). Overrides Default Look / colors below while on. Recommended default: false in a real scene (water reads best against real backgrounds).")]
@@ -200,6 +213,16 @@ public class FluidSceneMVP : MonoBehaviour
     Material smoothMat, shadeMat, compositeMat;
     Texture2D fieldTex;
     RenderTexture smoothedRT, smoothedRT2, cRT, mRT, nRT;
+    RenderTexture histA, histB;            // temporal stage ping-pong (r D, g T, b on, a M)
+    Material temporalMat;
+    bool hasHistory;
+    Vector3 eyePrev, rightPrev, upPrev, fwdPrev; float focalPrev;
+    /// <summary>Temporal-stage taps for LiveClipRecorder (valid during OnShaded): the stage's input, the history it read, its output.</summary>
+    public RenderTexture TemporalIn { get; private set; }
+    public RenderTexture TemporalHist { get; private set; }
+    public RenderTexture TemporalOut { get; private set; }
+    /// <summary>Raised every rendered frame after the shading blits.</summary>
+    public event Action OnShaded;
     float bilateralSigmaR;
     GameObject quadGO;
     Light mainLight;
@@ -242,6 +265,8 @@ public class FluidSceneMVP : MonoBehaviour
         public float v2R, v2TS, v2MinR, v2MaxR, thickScale, refLrParticleRadius, presmoothSigma, depthBias, simScale, kThick;
         public float[] mean, std, target, simOffset;
         public int winW, winH;
+        public string temporalMode; public float temporalAlphaRest, temporalV0, temporalV1, temporalRejectM; public bool temporalReproject, temporalMaskHysteresis;
+        public float inferMs;      // smoothed wall-clock ms of RunModel (Schedule + blocking readback) when the clip ended
     }
 
     public ClipSettings GetClipSettings() => new ClipSettings
@@ -254,7 +279,9 @@ public class FluidSceneMVP : MonoBehaviour
         simScale = transform.lossyScale.x, kThick = kThick,
         mean = meta.mean, std = meta.std, target = meta.target,
         simOffset = new[] { simOffset.x, simOffset.y, simOffset.z },
-        winW = W, winH = H,
+        winW = W, winH = H, inferMs = inferMs,
+        temporalMode = temporalMode.ToString(), temporalAlphaRest = temporalAlphaRest, temporalV0 = temporalSpeedRamp.x, temporalV1 = temporalSpeedRamp.y,
+        temporalRejectM = temporalRejectM, temporalReproject = temporalReproject, temporalMaskHysteresis = temporalMaskHysteresis,
     };
 
     void Start()
@@ -343,6 +370,14 @@ public class FluidSceneMVP : MonoBehaviour
         cRT = new RenderTexture(W, H, 0, RenderTextureFormat.ARGBHalf) { filterMode = FilterMode.Bilinear };
         mRT = new RenderTexture(W, H, 0, RenderTextureFormat.ARGBHalf) { filterMode = FilterMode.Bilinear };
         nRT = new RenderTexture(W, H, 0, RenderTextureFormat.ARGBHalf) { filterMode = FilterMode.Bilinear };
+        if (temporalMode != TemporalMode.Off)
+        {
+            var tsh = Shader.Find("Hidden/FluidTemporal");
+            if (tsh == null) throw new Exception("Hidden/FluidTemporal shader not found");
+            temporalMat = new Material(tsh);
+            histA = new RenderTexture(W, H, 0, RenderTextureFormat.ARGBFloat) { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+            histB = new RenderTexture(W, H, 0, RenderTextureFormat.ARGBFloat) { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+        }
 
         mainLight = RenderSettings.sun;
         if (mainLight == null)
@@ -610,7 +645,17 @@ public class FluidSceneMVP : MonoBehaviour
                     depth = a > 0f ? pred[i] * ds + dm : 0f;
                     thick = a > 0f ? Mathf.Max(pred[HW + i] * ts + tm, 0f) : 0f;
                 }
-                px[flipped] = new Color(depth, thick, a, 1f);
+                float spd = 1f;
+                if (temporalMat != null)
+                {   // |v_cam| of the INPUT at this pixel, de-normalised from the tensor the network just read (0 where the input is empty)
+                    spd = 0f;
+                    if (in7[6 * HW + i] > 0f)
+                    {
+                        float vx = in7[2 * HW + i] * meta.std[2] + meta.mean[2], vy = in7[3 * HW + i] * meta.std[3] + meta.mean[3], vz = in7[4 * HW + i] * meta.std[4] + meta.mean[4];
+                        spd = Mathf.Sqrt(vx * vx + vy * vy + vz * vz);
+                    }
+                }
+                px[flipped] = new Color(depth, thick, a, spd);
                 if (a > 0f) { dSum += depth; dSumSq += (double)depth * depth; fgCount++; }
             }
         bilateralSigmaR = 0.05f;
@@ -633,11 +678,37 @@ public class FluidSceneMVP : MonoBehaviour
                 (smoothedRT, smoothedRT2) = (smoothedRT2, smoothedRT);
             }
 
+        // temporal stage (067-EMA3): reprojected, motion-adaptive EMA + mask hysteresis. Off = the shading reads smoothedRT as before.
+        RenderTexture shadeSrc = smoothedRT;
+        if (temporalMat != null)
+        {
+            temporalMat.SetTexture("_FieldTex", fieldTex);
+            temporalMat.SetTexture("_HistTex", histB);
+            temporalMat.SetFloat("_HasHistory", hasHistory ? 1f : 0f);
+            temporalMat.SetFloat("_Reproject", temporalReproject ? 1f : 0f);
+            temporalMat.SetFloat("_Hyst", temporalMaskHysteresis ? 1f : 0f);
+            temporalMat.SetFloat("_ARest", temporalAlphaRest);
+            temporalMat.SetFloat("_V0", temporalSpeedRamp.x);
+            temporalMat.SetFloat("_V1", temporalSpeedRamp.y);
+            temporalMat.SetFloat("_RejectM", temporalRejectM);
+            temporalMat.SetFloat("_WinAspect", winAspect);
+            temporalMat.SetFloat("_FocalC", focalM); temporalMat.SetFloat("_FocalP", focalPrev);
+            temporalMat.SetVector("_EyeC", eyeSim); temporalMat.SetVector("_RightC", rightSim); temporalMat.SetVector("_UpC", upSim); temporalMat.SetVector("_FwdC", fwdSim);
+            temporalMat.SetVector("_EyeP", eyePrev); temporalMat.SetVector("_RightP", rightPrev); temporalMat.SetVector("_UpP", upPrev); temporalMat.SetVector("_FwdP", fwdPrev);
+            Graphics.Blit(smoothedRT, histA, temporalMat);
+            TemporalIn = smoothedRT; TemporalHist = histB; TemporalOut = histA;
+            shadeSrc = histA;
+            (histA, histB) = (histB, histA);       // this frame's output is next frame's history
+            hasHistory = true;
+            eyePrev = eyeSim; rightPrev = rightSim; upPrev = upSim; fwdPrev = fwdSim; focalPrev = focalM;
+        }
+
         // scene-independent shading packs at 512² (premultiplied by coverage)
         SetShadeParams(shadeMat);
-        Graphics.Blit(smoothedRT, cRT, shadeMat, 0);
-        Graphics.Blit(smoothedRT, mRT, shadeMat, 1);
-        Graphics.Blit(smoothedRT, nRT, shadeMat, 2);
+        Graphics.Blit(shadeSrc, cRT, shadeMat, 0);
+        Graphics.Blit(shadeSrc, mRT, shadeMat, 1);
+        Graphics.Blit(shadeSrc, nRT, shadeMat, 2);
+        OnShaded?.Invoke();
 
         // composite quad (samples scene color/depth in-render, pass 3)
         compositeMat.SetTexture("_CTex", cRT);
@@ -747,7 +818,7 @@ public class FluidSceneMVP : MonoBehaviour
             if (kb.pKey.wasPressedThisFrame) paused = !paused;
             if (kb.bKey.wasPressedThisFrame) bilateralSmoothing = !bilateralSmoothing;
             if (kb.vKey.wasPressedThisFrame) showRawInput = !showRawInput;
-            if (kb.rKey.wasPressedThisFrame) { simTime = 0f; provider?.ResetSim(); }
+            if (kb.rKey.wasPressedThisFrame) { simTime = 0f; provider?.ResetSim(); hasHistory = false; }
             if (kb.leftBracketKey.wasPressedThisFrame) playbackFps = Mathf.Max(1f, playbackFps - 5f);
             if (kb.rightBracketKey.wasPressedThisFrame) playbackFps += 5f;
 
@@ -813,6 +884,9 @@ public class FluidSceneMVP : MonoBehaviour
         if (cRT != null) cRT.Release();
         if (mRT != null) mRT.Release();
         if (nRT != null) nRT.Release();
+        if (histA != null) histA.Release();
+        if (histB != null) histB.Release();
+        if (temporalMat != null) Destroy(temporalMat);
         if (smoothMat != null) Destroy(smoothMat);
         if (shadeMat != null) Destroy(shadeMat);
         if (compositeMat != null) Destroy(compositeMat);
