@@ -14,8 +14,11 @@
 //      main directional light for specular.
 //   5. A camera-child quad (pass 1, premultiplied alpha) composites the result into the frame.
 //
-// The splat always uses a square frustum COVERING the camera's full (possibly wide) frustum,
-// so the model stays at its native 512² aspect-1 input; the composite samples the sub-window.
+// Focal Mode = CoverFrustum (default): the splat uses a square frustum COVERING the camera's full
+// (possibly wide) frustum, so the model stays at its native 512² aspect-1 input and the composite
+// samples the sub-window. FitVertical: the square fits the VERTICAL fov (focal = 1/tanV, the training
+// camera model); the model window is then the central square of the screen and the side strips of a
+// wide view carry no fluid (067: r_px*depth = r_w*focal*256 must sit in the training band 24-33 px.m).
 //
 // MVP caveats:
 //  - _CameraOpaqueTexture/_CameraDepthTexture are read during LateUpdate, i.e. they hold the
@@ -105,6 +108,10 @@ public class FluidSceneMVP : MonoBehaviour
     [Tooltip("V2 only: thickness scale (Python THICKNESS_SCALE_LEGACY = 3.9448). 0 = stats meta thicknessScale, else the constant.")]
     public float v2ThicknessScale = 0f;
 
+    public enum FocalMode { CoverFrustum, FitVertical }
+    [Tooltip("How the square 512² model window maps onto the camera. CoverFrustum (default, today's behaviour) = focal 1/max(tanV,tanH): covers the whole view, but at FOV 60 / 16:9 that is focal 0.97 vs the training cameras' 2.15-2.75, so every particle is 2.5-3x smaller on screen than the network saw at that depth. FitVertical = focal 1/tanV: the training camera model when the camera's vertical FOV is 40-50; the window is the central square of the screen.")]
+    public FocalMode focalMode = FocalMode.CoverFrustum;
+
     [Header("Shading")]
     [Tooltip("Gaussian blur sigma (px) on the masked depth buffer before shading. Recommended default: 2.")]
     public float presmoothSigma = 2f;
@@ -122,6 +129,8 @@ public class FluidSceneMVP : MonoBehaviour
     public float ks = 0.7f;
     [Tooltip("Blinn-Phong specular exponent. Recommended default: 120.")]
     public float shininess = 120f;
+    [Tooltip("World-units slack added to the scene-depth occlusion test in the composite (clip(sceneEye - fluidDepth + bias)). 0 = today's unbiased test, which z-fights wherever the fluid lies on scene geometry (the pool on the Ground plane).")]
+    public float depthBias = 0f;
 
     [Header("Color / Look")]
     [Tooltip("Blood look (see FluidLiveMVP). Overrides Default Look / colors below while on. Recommended default: false in a real scene (water reads best against real backgrounds).")]
@@ -207,6 +216,40 @@ public class FluidSceneMVP : MonoBehaviour
     bool ready;
 
     static Vector3 FlipZ(Vector3 v) => new Vector3(v.x, v.y, -v.z);
+
+    // ---------- read-only taps for LiveClipRecorder (067) ----------
+    float[] lastPred;
+    /// <summary>Raised every rendered frame right after inference; LastInput/LastPred are current.</summary>
+    public event Action OnInferred;
+    public bool Ready => ready;
+    public float[] LastInput => in7;
+    public float[] LastPred => lastPred;
+    public void GetSimCamera(out Vector3 eye, out Vector3 right, out Vector3 up, out Vector3 fwd, out float focal)
+    {
+        ComputeSimCamera();   // pure function of the transforms; the camera is final by LateUpdate
+        eye = eyeSim; right = rightSim; up = upSim; fwd = fwdSim; focal = focalM;
+    }
+
+    [Serializable]
+    public class ClipSettings
+    {
+        public string splatMode, focalMode, model, stats, backend;
+        public bool fp16Active, thicknessCountNormalize;
+        public float v2R, v2TS, v2MinR, v2MaxR, thickScale, refLrParticleRadius, presmoothSigma, depthBias, simScale, kThick;
+        public float[] mean, std, target, simOffset;
+    }
+
+    public ClipSettings GetClipSettings() => new ClipSettings
+    {
+        splatMode = splatMode.ToString(), focalMode = focalMode.ToString(),
+        model = modelAsset != null ? modelAsset.name : "", stats = statsJson != null ? statsJson.name : "",
+        backend = backend.ToString(), fp16Active = fp16Active, thicknessCountNormalize = thicknessCountNormalize,
+        v2R = v2R, v2TS = v2TS, v2MinR = v2MinR, v2MaxR = v2MaxR, thickScale = thickScale,
+        refLrParticleRadius = refLrParticleRadius, presmoothSigma = presmoothSigma, depthBias = depthBias,
+        simScale = transform.lossyScale.x, kThick = kThick,
+        mean = meta.mean, std = meta.std, target = meta.target,
+        simOffset = new[] { simOffset.x, simOffset.y, simOffset.z },
+    };
 
     void Start()
     {
@@ -390,7 +433,9 @@ public class FluidSceneMVP : MonoBehaviour
 
         tanV = Mathf.Tan(targetCamera.fieldOfView * Mathf.Deg2Rad * 0.5f);
         tanH = tanV * targetCamera.aspect;
-        focalM = 1f / Mathf.Max(tanV, tanH);    // square frustum covering the full camera frustum
+        focalM = focalMode == FocalMode.FitVertical
+            ? 1f / tanV                          // training camera model: square fits the vertical fov
+            : 1f / Mathf.Max(tanV, tanH);        // square frustum covering the full camera frustum
     }
 
     // ---------- splat: identical math to FluidLiveMVP.SplatToInput ----------
@@ -516,6 +561,8 @@ public class FluidSceneMVP : MonoBehaviour
         var sw = System.Diagnostics.Stopwatch.StartNew();
         float[] pred = RunModel();
         sw.Stop();
+        lastPred = pred;
+        OnInferred?.Invoke();
         inferMs = Mathf.Lerp(inferMs <= 0f ? (float)sw.Elapsed.TotalMilliseconds : inferMs,
                              (float)sw.Elapsed.TotalMilliseconds, 0.1f);
 
@@ -589,6 +636,7 @@ public class FluidSceneMVP : MonoBehaviour
         compositeMat.SetTexture("_NTex", nRT);
         compositeMat.SetFloat("_FocalM", focalM);
         compositeMat.SetFloat("_SimScale", transform.lossyScale.x);
+        compositeMat.SetFloat("_DepthBias", depthBias);
         Transform c = targetCamera.transform;
         compositeMat.SetVector("_CamRightWS", c.right);
         compositeMat.SetVector("_CamUpWS", c.up);

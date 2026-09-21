@@ -190,6 +190,7 @@ Shader "Hidden/FluidSSFRScene"
             float4 _CameraOpaqueTexture_TexelSize;
             sampler2D _CameraDepthTexture;
             float _SimScale;
+            float _DepthBias;   // world-units slack on the occlusion test (0 = unbiased)
 
             struct appdata { float4 vertex : POSITION; };
             struct v2f
@@ -227,7 +228,7 @@ Shader "Hidden/FluidSSFRScene"
                 float4 c1 = tex2D(_MTex, uvm);
                 float worldD = c1.a * inva * _SimScale;
                 float sceneEye = LinearEyeDepth(tex2D(_CameraDepthTexture, suv).r);
-                clip(sceneEye - worldD);
+                clip(sceneEye - worldD + _DepthBias);
 
                 // refracted scene color; offset stored in screen texels, alpha-normalized
                 float2 duv = tex2D(_NTex, uvm).rg * inva * _CameraOpaqueTexture_TexelSize.xy;

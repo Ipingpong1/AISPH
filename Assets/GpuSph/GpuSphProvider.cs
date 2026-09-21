@@ -59,6 +59,13 @@ public class GpuSphProvider : ParticleFrameProvider
     bool inited;
 
     public float LastStepMs => lastStepMs;
+    public float SolverTime => solverTime;
+
+    /// <summary>067 LiveClipRecorder tap: raised once per SOLVER frame (not per rendered frame) with
+    /// (solverFrameIndex, solverTime, records, count). Subscribing costs one readback per solver frame,
+    /// which GetFrame then reuses; with no subscriber the Tick loop is unchanged.</summary>
+    public event Action<int, float, float[], int> OnSolverFrame;
+    int solverFrameIdx;
     public int ActiveParticles => solver != null ? solver.Count : 0;
     public GpuSphSolver Solver { get { EnsureInit(); return solver; } }
 
@@ -128,6 +135,13 @@ public class GpuSphProvider : ParticleFrameProvider
             solver.gravity = gravity;
             solver.Step(step);
             recordsDirty = true;
+            if (OnSolverFrame != null)
+            {
+                cachedCount = solver.ReadbackFrame(records, posStage, velStage, densStage);
+                recordsDirty = false;
+                OnSolverFrame(solverFrameIdx, solverTime, records, cachedCount);
+            }
+            solverFrameIdx++;
         }
         sw.Stop();
         lastStepMs = (float)sw.Elapsed.TotalMilliseconds;   // dispatch + vmax readback, not GPU time
@@ -138,6 +152,7 @@ public class GpuSphProvider : ParticleFrameProvider
         EnsureInit();
         solver.Reset();
         solverTime = 0f;
+        solverFrameIdx = 0;
         timeSinceDrop = 0f;
         solver.SpawnBlock(blockMin, blockCount);
         recordsDirty = true;

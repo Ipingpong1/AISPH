@@ -224,7 +224,7 @@ public class SimExportRunner : MonoBehaviour
 
     // ---------------------------------------------------------------- output
 
-    static void Write1Lps(string path, List<float[]> frames)
+    public static void Write1Lps(string path, List<float[]> frames)
     {
         using var fh = new BinaryWriter(File.Create(path));
         fh.Write(0x53504C31); fh.Write(1); fh.Write(frames.Count);

@@ -84,3 +84,6 @@ SimExport/
 *.blob
 *.mp4
 Temp/
+
+# 067 frozen live clips (copied, with sha256, into SSU_restart/Experiments/067_live_gap/clips)
+LiveClips/
