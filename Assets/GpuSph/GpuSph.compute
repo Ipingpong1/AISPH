@@ -46,6 +46,9 @@ cbuffer Params
     float  _SCorrK;
     float  _InvSCorrDenom; // 1/W(0.2h), 0 if sCorr disabled
     float  _Xsph;
+    float  _WallDamp;      // 067, data-gen only (0 = off = live behaviour): 1/s decay of the TANGENTIAL velocity of particles
+                           // resting on a domain wall. The dense class's floor layer is a clamped coplanar sheet that skates
+                           // in-plane at up to the velocity cap while the fluid above is at rest (measured 8 m/s vs 0.03).
     float  _VelClamp;      // hard |v| cap after the velocity update (0 = off). The reference
                            // DFSPH data never exceeds ~9 m/s in this domain; PBF correction
                            // spikes (v = dx/dt) reached 42 m/s even with _DpClamp. Cap above
@@ -318,6 +321,16 @@ void FinalizeVelocity(uint3 id : SV_DispatchThreadID)
     if (i >= _N) return;
     float3 p = _Pred[i];
     float3 v = (p - _Pos[i]) / _Dt;
+    if (_WallDamp > 0.0)
+    {
+        float3 onWall = float3((p <= _DomainMin) | (p >= _DomainMax));     // per axis: clamped this substep
+        if (any(onWall > 0.0))
+        {
+            float3 keep = lerp(float3(1, 1, 1), float3(1, 1, 1) * exp(-_WallDamp * _Dt), 1.0 - onWall);   // damp the free axes only
+            v *= keep;
+            p = _Pos[i] + v * _Dt;                                          // position follows the damped velocity
+        }
+    }
     if (_VelClamp > 0.0)
     {
         float vl = length(v);

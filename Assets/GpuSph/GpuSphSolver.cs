@@ -29,6 +29,8 @@ public class GpuSphSolver : IDisposable
     public float dpClampFrac = 0.2f;
     [Tooltip("Hard velocity cap in m/s after the position-based update (0 = off). Reference DFSPH data never exceeds ~9 m/s in the 3m domain; PBF correction spikes reached 42 m/s even with dpClamp. 12 = above the physical envelope, cleans tails only.")]
     public float maxVelocity = 12f;
+    [Tooltip("067, data-gen only: 1/s decay of the tangential velocity of particles resting on a domain wall (0 = off, the live behaviour).")]
+    public float wallDamp = 0f;
     public Vector3 gravity = new Vector3(0f, -9.81f, 0f);
     public Vector3 domainMin = Vector3.zero;
     public Vector3 domainMax = new Vector3(3f, 3f, 3f);
@@ -130,6 +132,7 @@ public class GpuSphSolver : IDisposable
         cs.SetFloat("_Xsph", xsph);
         cs.SetFloat("_DpClamp", dpClampFrac > 0f ? dpClampFrac * h : 0f);
         cs.SetFloat("_VelClamp", maxVelocity);
+        cs.SetFloat("_WallDamp", wallDamp);
         BindAll();
         UploadObstacles();   // zero obstacles until told otherwise
     }
@@ -178,7 +181,10 @@ public class GpuSphSolver : IDisposable
 
     // Lattice block at spacing 2r, spawn order = ix-major (identical to LiveSphProvider.SpawnBlock).
     // Returns particles actually added (clipped to maxParticles).
-    public int SpawnBlock(Vector3 blockMin, Vector3Int count)
+    // `shuffle` (067, data-gen only; null = today's order): seeded Fisher-Yates over the block's spawn order. The
+    // training LR keeps every 25th particle BY INDEX; on an ix-major lattice that is a degenerate rod sub-lattice,
+    // which a dam break mixes away and a coherent pool does not. Shuffling makes index-thinning a random subsample.
+    public int SpawnBlock(Vector3 blockMin, Vector3Int count, System.Random shuffle = null)
     {
         float spacing = 2f * particleRadius;
         int added = 0, start = n;
@@ -191,6 +197,12 @@ public class GpuSphSolver : IDisposable
                     n++; added++;
                 }
         done:
+        if (shuffle != null)
+            for (int i = added - 1; i > 0; i--)
+            {
+                int j = shuffle.Next(i + 1);
+                (spawnStage[i], spawnStage[j]) = (spawnStage[j], spawnStage[i]);
+            }
         if (added > 0)
         {
             bPos.SetData(spawnStage, 0, start, added);
@@ -260,8 +272,18 @@ public class GpuSphSolver : IDisposable
         float dtMax = cfl * h / vmax;
         int steps = Mathf.Clamp(Mathf.CeilToInt(frameDt / dtMax), 1, maxSubsteps);
         float dt = frameDt / steps;
-        for (int s = 0; s < steps; s++) Substep(dt);
+        for (int s = 0; s < steps; s++)
+        {
+            beforeSubstep?.Invoke((s + 1f) / steps);
+            Substep(dt);
+        }
     }
+
+    /// <summary>067, data-gen only (null = today's behaviour): called before every CFL substep with the fraction of the
+    /// solver frame that substep ENDS at. Obstacles are a position projection, so a prop moved once per frame ejects the
+    /// fluid in its swept shell during the first substep at ~v_obs x steps; dense solves take 6-32 substeps, the live
+    /// coarse solve 1-3. Moving the prop per substep keeps the imparted velocity ~v_obs in both.</summary>
+    public Action<float> beforeSubstep;
 
     static float BitsToFloat(uint u) => BitConverter.Int32BitsToSingle((int)u);
 

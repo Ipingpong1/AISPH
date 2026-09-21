@@ -48,6 +48,20 @@ public class SimExportRunner : MonoBehaviour
     public float stopAt = 1.5f;
     public int exportFps = 25;
 
+    public enum Family { DamBreak, PoolSlosh, PoolDrop, PoolStir, PoolStirDrop }
+    [Header("Scene families (067). Sim s uses families[s % Length]; {DamBreak} = the GpuPbfV1 generator, unchanged.")]
+    public Family[] families = { Family.DamBreak };
+    [Tooltip("Pool families: clip length [s]. Every disturbance ends >= 1.5 s earlier, so each clip has a settle tail.")]
+    public float poolStopAt = 5f;
+    [Tooltip("Pool families: CFL substep cap (dense class needs 32, see Max Substeps).")]
+    public int poolMaxSubsteps = 32;
+    [Tooltip("Pool families: particle budget; the pool is made shallower until pool + drops fit.")]
+    public int poolParticleCap = 200000;
+    [Tooltip("Pool families: GpuSphSolver.wallDamp [1/s]. 0 reproduces the skating floor layer of the dense class.")]
+    public float poolWallDamp = 0f;
+    [Tooltip("Pool families: PBF constraint iterations per substep. 3 (the live / dam-break value) UNDER-CONVERGES a resting 7-13 layer dense column: measured 2026-09-21, median density 800-850 instead of 1000 and a floor monolayer skating at 7-8 m/s (14 % of the fluid above 6 m/s) under calm water. 10 -> density 1000, 0.00 % above 6 m/s, and FEWER CFL substeps.")]
+    public int poolSolverIters = 10;
+
     [Header("Domain (training convention: [0,3]³)")]
     public float domainSize = 3f;
     public float padding = 0.2f;
@@ -78,10 +92,14 @@ public class SimExportRunner : MonoBehaviour
     public IEnumerator RunAll()
     {
         Directory.CreateDirectory(OutDir);
+        Application.runInBackground = true;
         for (int s = 0; s < simCount; s++)
         {
             var rng = new System.Random(seed + s);
-            yield return RunOne($"sim_{s:0000}", rng);
+            Family fam = families != null && families.Length > 0 ? families[s % families.Length] : Family.DamBreak;
+            if (File.Exists(Path.Combine(OutDir, $"sim_{s:0000}_scene.json"))) continue;   // resumable
+            if (fam == Family.DamBreak) yield return RunOne($"sim_{s:0000}", rng);
+            else yield return RunPool($"sim_{s:0000}", rng, fam);
         }
         Debug.Log($"[SimExportRunner] batch done: {simCount} sims -> {OutDir}\n" +
                   $"next: SSU-python unity_sim_to_bgeo.py --dump_dir {OutDir} --out Simulations/{rootName}");
@@ -166,6 +184,136 @@ public class SimExportRunner : MonoBehaviour
     }
 
     static float Lerp(System.Random rng, float a, float b) => a + (float)rng.NextDouble() * (b - a);
+
+    // ---------------------------------------------------------------- pool families (067: the live demo's content)
+    // A shallow pool in the [0,3]^3 tank (the live scene is 17-44 cm deep), disturbed the way the player disturbs it:
+    // a tilted start (slosh), block drops into the pool (the live F key), a moving stir sphere — then left to settle.
+    // Spawn order is SHUFFLED so the pipeline's index thinning (every 25th particle) is a random subsample, and the
+    // stirrer moves per CFL substep (see GpuSphSolver.SpawnBlock / beforeSubstep for why).
+
+    struct Drop { public float t; public Vector3 start; public Vector3Int count; public float cube; public int added; }
+
+    IEnumerator RunPool(string name, System.Random rng, Family fam)
+    {
+        float radius = Lerp(rng, radiusMin, radiusMax);
+        float spacing = 2f * radius;
+        float depth = rng.NextDouble() < 0.7 ? Lerp(rng, 0.10f, 0.30f) : Lerp(rng, 0.30f, 0.40f);
+        float fill = fam == Family.PoolSlosh ? Lerp(rng, 0.55f, 1f) : 1f;          // slab collapse = the slosh
+        float gMag = Lerp(rng, 9.3f, 10.3f);
+        Vector3 gRest = new Vector3(0f, -gMag, 0f);
+        float tiltDeg = fam == Family.PoolSlosh ? Lerp(rng, 8f, 20f) : 0f, tiltT = Lerp(rng, 0.3f, 0.8f), tiltAz = Lerp(rng, 0f, 6.2832f);
+        Vector3 gTilt = Quaternion.AngleAxis(tiltDeg, new Vector3(Mathf.Cos(tiltAz), 0f, Mathf.Sin(tiltAz))) * gRest;
+
+        bool stir = fam == Family.PoolStir || fam == Family.PoolStirDrop;
+        bool dropFam = fam == Family.PoolDrop || fam == Family.PoolStirDrop;
+        StirPath.Params sp = stir ? StirPath.Sample(rng, depth, poolStopAt, domainSize) : default;
+
+        // drops: 1-3 cubes, bottom clear of the pool, top <= 1.4 m (keeps blocks off the near cameras), >= 0.8 s apart
+        var drops = new List<Drop>();
+        if (dropFam)
+        {
+            int want = rng.Next(1, 4); float tPrev = -10f;
+            for (int k = 0; k < want; k++)
+            {
+                float cube = Lerp(rng, 0.25f, 0.55f);
+                float t = Lerp(rng, 0.4f, poolStopAt - 2.0f);
+                float y0 = Lerp(rng, depth + 0.35f, Mathf.Max(depth + 0.36f, 1.4f - cube));
+                var start = new Vector3(Lerp(rng, 0.1f, domainSize - 0.1f - cube), y0, Lerp(rng, 0.1f, domainSize - 0.1f - cube));
+                if (Mathf.Abs(t - tPrev) < 0.8f) continue;
+                if (stir)   // never spawn a block on top of the stir sphere
+                {
+                    Vector3 c = StirPath.Eval(sp, t), bc = start + Vector3.one * (cube * 0.5f);
+                    if ((c - bc).magnitude < sp.diameter * 0.5f + cube * 0.87f + 0.1f) continue;
+                }
+                int n1 = Mathf.Max(1, Mathf.FloorToInt(cube / spacing));
+                drops.Add(new Drop { t = t, start = start, count = new Vector3Int(n1, n1, n1), cube = cube }); tPrev = t;
+            }
+            drops.Sort((a, b) => a.t.CompareTo(b.t));
+        }
+        long dropTotal = 0; foreach (var d in drops) dropTotal += (long)d.count.x * d.count.y * d.count.z;
+
+        int nx = Mathf.Max(2, Mathf.FloorToInt((domainSize * fill - 2f * radius) / spacing) + 1);
+        int nz = Mathf.Max(2, Mathf.FloorToInt((domainSize - 2f * radius) / spacing) + 1);
+        int ny = Mathf.Max(2, Mathf.RoundToInt(depth / spacing));
+        while (ny > 2 && (long)nx * ny * nz + dropTotal > poolParticleCap) ny--;
+        depth = ny * spacing;
+        long capacity = (long)nx * ny * nz + dropTotal;
+        if (capacity > maxParticlesCap) { Debug.LogError($"[SimExportRunner] {name}: {capacity} particles exceeds cap — skipped"); yield break; }
+
+        var solver = new GpuSphSolver(sphCompute)
+        {
+            particleRadius = radius, maxParticles = (int)capacity, gravity = tiltDeg > 0f ? gTilt : gRest,
+            domainMin = Vector3.zero, domainMax = Vector3.one * domainSize, maxSubsteps = poolMaxSubsteps, wallDamp = poolWallDamp, solverIters = poolSolverIters,
+        };
+        solver.Init();
+        solver.ClearObstacles(); solver.UploadObstacles();
+        int spawned = solver.SpawnBlock(new Vector3(radius, radius, radius), new Vector3Int(nx, ny, nz), rng);
+        int initial = spawned;
+
+        float dt = 1f / exportFps, tFrame = 0f;
+        if (stir)
+            solver.beforeSubstep = frac =>
+            {
+                float t = tFrame + frac * dt;
+                solver.ClearObstacles();
+                if (StirPath.Active(sp, t))
+                    solver.SetObstacle(0, Matrix4x4.TRS(StirPath.Eval(sp, t), Quaternion.identity, Vector3.one * sp.diameter).inverse,
+                                       (int)LiveSphProvider.Obstacle.Shape.Sphere, true);
+                solver.UploadObstacles();
+            };
+
+        var records = new float[capacity * 7];                       // sized by CAPACITY: drops grow the count mid-sim
+        var posStage = new Vector3[capacity]; var velStage = new Vector3[capacity]; var densStage = new float[capacity];
+        int frames = Mathf.RoundToInt(poolStopAt * exportFps);
+        var dump = new List<float[]>(frames);
+        int nextDrop = 0;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        for (int f = 0; f < frames; f++)
+        {
+            tFrame = f * dt;
+            if (tiltDeg > 0f) solver.gravity = tFrame < tiltT ? gTilt : gRest;
+            while (nextDrop < drops.Count && drops[nextDrop].t <= tFrame)
+            {
+                var d = drops[nextDrop];
+                d.added = solver.SpawnBlock(d.start, d.count, rng);
+                if (d.added != d.count.x * d.count.y * d.count.z)
+                    Debug.LogError($"[SimExportRunner] {name}: drop {nextDrop} added {d.added} of {d.count.x * d.count.y * d.count.z} — capacity bug");
+                drops[nextDrop] = d; spawned += d.added; nextDrop++;
+            }
+            solver.Step(dt);
+            int n = solver.ReadbackFrame(records, posStage, velStage, densStage);
+            var copy = new float[n * 7];
+            Array.Copy(records, copy, n * 7);
+            dump.Add(copy);
+            if (f % 5 == 0) yield return null;   // keep the editor alive
+        }
+        sw.Stop();
+        solver.Dispose();
+
+        Write1Lps(Path.Combine(OutDir, name + ".bytes"), dump);
+        var ci = CultureInfo.InvariantCulture;
+        string V(float v) => v.ToString("0.#####", ci);
+        string V3(Vector3 v) => $"[{V(v.x)}, {V(v.y)}, {V(v.z)}]";
+        var sb = new StringBuilder();
+        sb.Append("{\n");
+        sb.Append($"  \"solver\": \"unity_gpu_pbf\",\n  \"family\": \"{fam}\",\n  \"seed\": {seed},\n");
+        sb.Append($"  \"particle_radius\": {V(radius)},\n  \"stop_at\": {V(poolStopAt)},\n  \"export_fps\": {exportFps},\n");
+        sb.Append($"  \"gravitation\": {V3(gRest)},\n  \"max_substeps\": {poolMaxSubsteps},\n  \"wall_damp\": {V(poolWallDamp)},\n  \"solver_iters\": {poolSolverIters},\n  \"lr_shuffle\": true,\n");
+        sb.Append($"  \"pool_depth\": {V(depth)},\n  \"pool_fill\": {V(fill)},\n  \"pool_lattice\": [{nx}, {ny}, {nz}],\n");
+        sb.Append($"  \"gravity_schedule\": [{{\"t0\": 0, \"t1\": {V(tiltDeg > 0f ? tiltT : 0f)}, \"g\": {V3(tiltDeg > 0f ? gTilt : gRest)}, \"tilt_deg\": {V(tiltDeg)}}}],\n");
+        sb.Append("  \"drops\": [");
+        for (int i = 0; i < drops.Count; i++)
+            sb.Append((i > 0 ? ", " : "") + $"{{\"t\": {V(drops[i].t)}, \"cube\": {V(drops[i].cube)}, \"start\": {V3(drops[i].start)}, \"count\": {drops[i].added}}}");
+        sb.Append("],\n");
+        sb.Append(stir
+            ? $"  \"stirrer\": {{\"diameter\": {V(sp.diameter)}, \"y_stir\": {V(sp.yStir)}, \"center\": [{V(sp.cx)}, {V(sp.cz)}], \"amp\": [{V(sp.ax)}, {V(sp.az)}], " +
+              $"\"freq\": [{V(sp.fx)}, {V(sp.fz)}], \"phase\": [{V(sp.phx)}, {V(sp.phz)}], \"t_in\": {V(sp.tIn)}, \"t_out\": {V(sp.tOut)}, \"max_speed\": {V(sp.maxSpeed)}, \"substepped\": true}},\n"
+            : "  \"stirrer\": null,\n");
+        sb.Append($"  \"particle_count_initial\": {initial},\n  \"particle_count\": {spawned},\n  \"solve_sec\": {V((float)sw.Elapsed.TotalSeconds)},\n  \"obstacles\": []\n}}\n");
+        File.WriteAllText(Path.Combine(OutDir, name + "_scene.json"), sb.ToString());
+        Debug.Log($"[SimExportRunner] {name} ({fam}): {initial}->{spawned} particles x {frames} frames, depth {depth:0.00} r {radius:0.0000} " +
+                  $"in {sw.Elapsed.TotalSeconds:0.0}s -> {OutDir}");
+    }
 
     // ---------------------------------------------------------------- obstacles (runner.py parity)
 
