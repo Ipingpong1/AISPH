@@ -36,6 +36,7 @@ Shader "Hidden/FluidSSFRScene"
     float _UseEnvCube;
 
     float _FocalM;
+    float _WinAspect;   // model window W/H (067; unset/0 = the square window of before)
     float3 _CamRightWS, _CamUpWS, _CamFwdWS;
     float _KThick, _RefrStrength, _F0, _Shininess, _Ks, _FrMax;
     float3 _AbsorbSigma, _BodyTint, _SpecTint;
@@ -47,7 +48,8 @@ Shader "Hidden/FluidSSFRScene"
     {
         float D = max(tex2D(_MainTex, uv).r, 1e-4);
         float2 ndc = uv * 2.0 - 1.0;
-        return float3(ndc.x * D / _FocalM, ndc.y * D / _FocalM, -D);
+        float wa = _WinAspect > 0.0 ? _WinAspect : 1.0;
+        return float3(ndc.x * wa * D / _FocalM, ndc.y * D / _FocalM, -D);
     }
 
     // Environment for reflections: real probe/skybox cubemap, else a procedural sky.
@@ -98,6 +100,7 @@ Shader "Hidden/FluidSSFRScene"
 
         // World-space normal / view ray for environment reflection + specular.
         float2 slope = (uv * 2.0 - 1.0) / _FocalM;
+        slope.x *= _WinAspect > 0.0 ? _WinAspect : 1.0;
         float3 Nw = _CamRightWS * N.x + _CamUpWS * N.y - _CamFwdWS * N.z;
         float3 rd = normalize(_CamRightWS * slope.x + _CamUpWS * slope.y + _CamFwdWS);
 
@@ -213,7 +216,9 @@ Shader "Hidden/FluidSSFRScene"
                 float df = dot(i.ray, _CamFwdWS);
                 clip(df - 1e-6);
                 float2 slope = float2(dot(i.ray, _CamRightWS), dot(i.ray, _CamUpWS)) / df;
-                float2 uvm = slope * _FocalM * 0.5 + 0.5;
+                float2 uvm = slope * _FocalM * 0.5;
+                uvm.x /= _WinAspect > 0.0 ? _WinAspect : 1.0;
+                uvm += 0.5;
                 clip(uvm);
                 clip(1.0 - uvm);
 

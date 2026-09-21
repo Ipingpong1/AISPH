@@ -111,6 +111,8 @@ public class FluidSceneMVP : MonoBehaviour
     public enum FocalMode { CoverFrustum, FitVertical }
     [Tooltip("How the square 512² model window maps onto the camera. CoverFrustum (default, today's behaviour) = focal 1/max(tanV,tanH): covers the whole view, but at FOV 60 / 16:9 that is focal 0.97 vs the training cameras' 2.15-2.75, so every particle is 2.5-3x smaller on screen than the network saw at that depth. FitVertical = focal 1/tanV: the training camera model when the camera's vertical FOV is 40-50; the window is the central square of the screen.")]
     public FocalMode focalMode = FocalMode.CoverFrustum;
+    [Tooltip("Model window width in px (height is 512). 512 = today's square window. 896 = a 16:9-class window at the SAME focal: FitVertical then covers the full width of a 16:9 view instead of its central 56 %. Needs the V2 splat and a model exported for a 1x7x512x896 input with a NON-square core (Unity_Models/*_wide896x512.onnx, SSU_restart/Helpers/export_onnx_wide.py) — a square-window model will not load into a wide tensor. Offline (067): same weights, central window identical to the square network (mask IoU 0.98-0.999, depth |d| median < 1 mm), side strips as healthy.")]
+    public int windowWidth = 512;
 
     [Header("Shading")]
     [Tooltip("Gaussian blur sigma (px) on the masked depth buffer before shading. Recommended default: 2.")]
@@ -172,7 +174,9 @@ public class FluidSceneMVP : MonoBehaviour
 
     // ---------- state ----------
 
-    const int H = 512, W = 512, HW = H * W;
+    const int H = 512;
+    int W = 512, HW = H * 512;            // W = windowWidth, fixed at Init (067: a wide model window)
+    float winAspect = 1f;                  // W / H
     const int SplatR = 5;                  // LR splat: radius 5 px square stamp, sigma 2.0
     const float SigmaPx = 2f;
 
@@ -237,6 +241,7 @@ public class FluidSceneMVP : MonoBehaviour
         public bool fp16Active, thicknessCountNormalize;
         public float v2R, v2TS, v2MinR, v2MaxR, thickScale, refLrParticleRadius, presmoothSigma, depthBias, simScale, kThick;
         public float[] mean, std, target, simOffset;
+        public int winW, winH;
     }
 
     public ClipSettings GetClipSettings() => new ClipSettings
@@ -249,6 +254,7 @@ public class FluidSceneMVP : MonoBehaviour
         simScale = transform.lossyScale.x, kThick = kThick,
         mean = meta.mean, std = meta.std, target = meta.target,
         simOffset = new[] { simOffset.x, simOffset.y, simOffset.z },
+        winW = W, winH = H,
     };
 
     void Start()
@@ -284,6 +290,9 @@ public class FluidSceneMVP : MonoBehaviour
                 kernel[k] = (float)Math.Exp(-(ox * ox + oy * oy) / (2.0 * SigmaPx * SigmaPx));
 
         useV2 = splatMode == SplatMode.V2;
+        W = windowWidth > 0 ? windowWidth : 512; HW = H * W; winAspect = (float)W / H;
+        if (W != 512 && (W % 32 != 0 || !useV2))
+            throw new Exception($"FluidSceneMVP: windowWidth {W} needs the V2 splat and a multiple of 32 (the legacy stamp path is square-only)");
         if (useV2)
         {
             v2R = v2WorldRadius > 0f ? v2WorldRadius : (provider.ParticleRadius > 0f ? provider.ParticleRadius : meta.coarseRadius);
@@ -434,8 +443,8 @@ public class FluidSceneMVP : MonoBehaviour
         tanV = Mathf.Tan(targetCamera.fieldOfView * Mathf.Deg2Rad * 0.5f);
         tanH = tanV * targetCamera.aspect;
         focalM = focalMode == FocalMode.FitVertical
-            ? 1f / tanV                          // training camera model: square fits the vertical fov
-            : 1f / Mathf.Max(tanV, tanH);        // square frustum covering the full camera frustum
+            ? 1f / tanV                                  // training camera model: the window's HEIGHT fits the vertical fov
+            : 1f / Mathf.Max(tanV, tanH / winAspect);    // window covering the full camera frustum (winAspect 1 = the square of before)
     }
 
     // ---------- splat: identical math to FluidLiveMVP.SplatToInput ----------
@@ -635,6 +644,7 @@ public class FluidSceneMVP : MonoBehaviour
         compositeMat.SetTexture("_MTex", mRT);
         compositeMat.SetTexture("_NTex", nRT);
         compositeMat.SetFloat("_FocalM", focalM);
+        compositeMat.SetFloat("_WinAspect", winAspect);
         compositeMat.SetFloat("_SimScale", transform.lossyScale.x);
         compositeMat.SetFloat("_DepthBias", depthBias);
         Transform c = targetCamera.transform;
@@ -671,6 +681,7 @@ public class FluidSceneMVP : MonoBehaviour
     {
         Transform c = targetCamera.transform;
         m.SetFloat("_FocalM", focalM);
+        m.SetFloat("_WinAspect", winAspect);
         m.SetVector("_CamRightWS", c.right);
         m.SetVector("_CamUpWS", c.up);
         m.SetVector("_CamFwdWS", c.forward);
