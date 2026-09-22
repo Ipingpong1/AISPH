@@ -491,8 +491,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::FluidSceneMVP
   provider: {fileID: 336920072}
-  statsJson: {fileID: 4900000, guid: 83dc9f6186edad2ea975f4753521bf23, type: 3}
-  modelAsset: {fileID: 5022602860645237092, guid: 59ae9a73d228bc721b71e3a200c37d81, type: 3}
+  statsJson: {fileID: 4900000, guid: 6444aa6a08d826a008bac915303d83c1, type: 3}
+  modelAsset: {fileID: 5022602860645237092, guid: c963adbd3d41a02e1b3db62c29958eda, type: 3}
   sceneShader: {fileID: 0}
   smoothShader: {fileID: 0}
   targetCamera: {fileID: 330585545}
@@ -501,13 +501,15 @@ MonoBehaviour:
   speed: 1
   backend: 256
   useFp16: 0
-  kThickOverride: 0.13
+  kThickOverride: 0.5
   thicknessCountNormalize: 0
   parityDumpPath: 
   refLrParticleRadius: 0.04302
-  splatMode: 0
-  v2WorldRadius: 0.03
+  splatMode: 1
+  v2WorldRadius: 0
   v2ThicknessScale: 0
+  focalMode: 1
+  windowWidth: 512
   presmoothSigma: 0
   bilateralSmoothing: 0
   bilateralSigmaS: 3
@@ -516,6 +518,14 @@ MonoBehaviour:
   refrStrength: 22
   ks: 0.7
   shininess: 120
+  depthBias: 0
+  temporalMode: 0
+  temporalAlphaRest: 0.3
+  temporalSpeedRamp: {x: 0.1, y: 0.5}
+  temporalRejectM: 0.1
+  temporalReproject: 1
+  temporalDepthGate: {x: 0, y: 0}
+  temporalMaskHysteresis: 1
   bloodMode: 0
   defaultLook: 1
   absorbColor: {r: 0.45, g: 0.16, b: 0.1, a: 1}
