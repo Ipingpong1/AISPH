@@ -46,8 +46,6 @@ SimExport/**/*.bytes
 SimExport/GpuPbfV1/sim_0025.bytes
 
 # SSU restart 2026-09-18: large / regenerable artefacts stay out of the repo
-*.onnx
-*.onnx.meta
 ParityDump/
 FrameData*/
 Captures/
