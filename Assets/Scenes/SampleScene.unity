@@ -491,8 +491,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::FluidSceneMVP
   provider: {fileID: 336920072}
-  statsJson: {fileID: 4900000, guid: 6444aa6a08d826a008bac915303d83c1, type: 3}
-  modelAsset: {fileID: 5022602860645237092, guid: c963adbd3d41a02e1b3db62c29958eda, type: 3}
+  statsJson: {fileID: 4900000, guid: f59b2f8791586abd4ae5976ab3d31e03, type: 3}
+  modelAsset: {fileID: 5022602860645237092, guid: 932443ddbca95523b9863be539e82876, type: 3}
   sceneShader: {fileID: 0}
   smoothShader: {fileID: 0}
   targetCamera: {fileID: 330585545}
@@ -500,7 +500,9 @@ MonoBehaviour:
   playbackFps: 25
   speed: 1
   backend: 256
-  useFp16: 0
+  useFp16: 1
+  spreadFrames: 0
+  spreadFramesMobile: 3
   kThickOverride: 0.5
   thicknessCountNormalize: 0
   parityDumpPath: 
@@ -512,9 +514,9 @@ MonoBehaviour:
   windowWidth: 512
   presmoothSigma: 0
   bilateralSmoothing: 0
-  bilateralSigmaS: 3
-  bilateralIters: 4
-  bilateralRangeScale: 0.12
+  bilateralSigmaS: 1
+  bilateralIters: 2
+  bilateralRangeScale: 0.15
   refrStrength: 22
   ks: 0.7
   shininess: 120
@@ -533,6 +535,44 @@ MonoBehaviour:
   fallbackSkyTop: {r: 0.27, g: 0.47, b: 0.78, a: 1}
   fallbackSkyHorizon: {r: 0.8, g: 0.88, b: 0.95, a: 1}
   fallbackGround: {r: 0.16, g: 0.19, b: 0.24, a: 1}
+  foamEnabled: 1
+  foamOnlyView: 0
+  foamRadiusOverride: 0
+  foamSpawnScale: 20
+  foamKTa: 8
+  foamKWc: 12
+  foamTauScale: 1
+  foamTauDecay: 0.98
+  foamTauPercentile: 0.995
+  foamTauMinFrac: 0.25
+  foamKineticSpeed: {x: 1, y: 3}
+  foamCrestMinVelDotN: 0.6
+  foamSurfaceFrac: 0.75
+  foamNFullPercentile: 0.9
+  foamMaxDiffuse: 20000
+  foamLifetime: {x: 1, y: 4}
+  foamSprayFrac: 0.15
+  foamBubbleFrac: 0.6
+  foamBuoyancy: 0.5
+  foamDrag: 0.7
+  foamGravity: {x: 0, y: -9.81, z: 0}
+  foamSprayMaxAge: 3
+  foamOrphanMaxAge: 1
+  foamFloorY: -0.05
+  foamDomainMin: {x: -1, y: -0.1, z: -1}
+  foamDomainMax: {x: 4, y: 4, z: 4}
+  foamColor: {r: 0.96, g: 0.98, b: 1, a: 1}
+  foamBrightness: 1
+  foamLightInfluence: 0
+  foamCoverageK: 0.8
+  foamOpacity: 1
+  foamSpriteScale: 1
+  foamSpriteFrac: {x: 0.33, y: 0.5}
+  foamMaxSpritePx: 3
+  foamTypeWeights: {x: 0.6, y: 1, z: 0.5}
+  foamHiddenWeight: 0.12
+  foamDepthTolR: 4
+  foamBlur: 1
   flyControls: 1
   moveSpeed: 2
   lookSpeedDegPerPx: 0.15
@@ -1253,6 +1293,7 @@ MonoBehaviour:
   xzMin: {x: -1.45, y: -1.45}
   xzMax: {x: 1.45, y: 1.45}
   scripted: 0
+  mouseInput: 1
 --- !u!1001 &1525186229
 PrefabInstance:
   m_ObjectHideFlags: 0

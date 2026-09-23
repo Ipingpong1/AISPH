@@ -44,8 +44,15 @@ public class ObstacleSpawner : MonoBehaviour
     {
         p = Vector3.zero;
         var ms = Mouse.current;
-        if (ms == null) return false;
-        Ray r = cam.ScreenPointToRay(ms.position.ReadValue());
+        return ms != null && ScreenToGround(ms.position.ReadValue(), out p);
+    }
+
+    /// <summary>Ground-plane (y = 0) hit under a screen point (pixels, bottom-left origin).</summary>
+    public bool ScreenToGround(Vector2 screenPos, out Vector3 p)
+    {
+        p = Vector3.zero;
+        if (cam == null) return false;
+        Ray r = cam.ScreenPointToRay(screenPos);
         var ground = new Plane(Vector3.up, Vector3.zero);
         if (!ground.Raycast(r, out float t)) return false;
         p = r.GetPoint(t);
@@ -92,7 +99,7 @@ public class ObstacleSpawner : MonoBehaviour
         if (!showHelp) return;
         GUI.Label(new Rect(10, 30, 1800, 24),
             "LMB drag: stir sphere   scroll: stirrer height   N / M: box / sphere at mouse   Backspace: remove last   "
-            + "F: drop block   R: reset   B: bilateral   V: raw input   P: pause   WASD + RMB: fly");
+            + "F: drop block   R: reset   B: bilateral   V: raw input   P: pause   G: foam   H: foam only   WASD + RMB: fly");
     }
 
     public void RemoveLast()

@@ -20,6 +20,8 @@ public class MouseStirrer : MonoBehaviour
     public Vector2 xzMin = new Vector2(-1.45f, -1.45f), xzMax = new Vector2(1.45f, 1.45f);
     [Tooltip("Set by SetTarget() for scripted/MCP tests; cleared by the next mouse drag.")]
     public bool scripted;
+    [Tooltip("Read the mouse (LMB drag / scroll). TouchControls turns this off while it drives the stirrer.")]
+    public bool mouseInput = true;
 
     Vector3 target;
 
@@ -36,26 +38,31 @@ public class MouseStirrer : MonoBehaviour
         scripted = true;
     }
 
+    /// <summary>Move the target under a screen point (pixels, bottom-left origin) on the current height plane.</summary>
+    public void DriveTo(Vector2 screenPos)
+    {
+        if (cam == null) return;
+        scripted = false;
+        Ray r = cam.ScreenPointToRay(screenPos);
+        var plane = new Plane(Vector3.up, new Vector3(0f, target.y, 0f));
+        if (plane.Raycast(r, out float t))
+        {
+            Vector3 h = r.GetPoint(t);
+            target.x = Mathf.Clamp(h.x, xzMin.x, xzMax.x);
+            target.z = Mathf.Clamp(h.z, xzMin.y, xzMax.y);
+        }
+    }
+
+    public void NudgeHeight(float dy) => target.y = Mathf.Clamp(target.y + dy, minY, maxY);
+
     void Update()
     {
         var ms = Mouse.current;
-        if (ms != null && cam != null)
+        if (mouseInput && ms != null && cam != null)
         {
             float scroll = ms.scroll.ReadValue().y;
-            if (Mathf.Abs(scroll) > 0.01f)
-                target.y = Mathf.Clamp(target.y + Mathf.Sign(scroll) * scrollHeightStep, minY, maxY);
-            if (ms.leftButton.isPressed)
-            {
-                scripted = false;
-                Ray r = cam.ScreenPointToRay(ms.position.ReadValue());
-                var plane = new Plane(Vector3.up, new Vector3(0f, target.y, 0f));
-                if (plane.Raycast(r, out float t))
-                {
-                    Vector3 h = r.GetPoint(t);
-                    target.x = Mathf.Clamp(h.x, xzMin.x, xzMax.x);
-                    target.z = Mathf.Clamp(h.z, xzMin.y, xzMax.y);
-                }
-            }
+            if (Mathf.Abs(scroll) > 0.01f) NudgeHeight(Mathf.Sign(scroll) * scrollHeightStep);
+            if (ms.leftButton.isPressed) DriveTo(ms.position.ReadValue());
         }
         float a = 1f - Mathf.Exp(-followSpeed * Time.deltaTime);
         transform.position = Vector3.Lerp(transform.position, target, a);

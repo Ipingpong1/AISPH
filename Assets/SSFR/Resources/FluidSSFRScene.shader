@@ -15,7 +15,10 @@
 //   pass 3 "COMPOSITE" (camera-child quad, transparent queue): reconstructs the per-pixel
 //     view ray in world space, maps it into the model sub-window (the splat used a square
 //     frustum covering the whole camera frustum), samples the packs, occlusion-tests against
-//     _CameraDepthTexture, refracts _CameraOpaqueTexture, and alpha-composites.
+//     _CameraDepthTexture, refracts _CameraOpaqueTexture, and alpha-composites. Optional 059
+//     whitewater layer (FoamLayer, _FoamOn): density -> coverage 1 - exp(-k D) laid OVER the
+//     fluid, so spray also shows where there is no fluid; occluded by the scene through its own
+//     depth where it has one (spray off the surface), else through the fluid's.
 //
 // Normal reconstruction runs in the splat camera's view space (sim units); the components
 // transfer to world space through the camera basis (_CamRightWS/_CamUpWS/_CamFwdWS).
@@ -25,6 +28,13 @@ Shader "Hidden/FluidSSFRScene"
     {
         _MainTex ("Fields (R=depth sim units, G=thickness, B=alpha)", 2D) = "black" {}
         _EnvCube ("Reflection cubemap", Cube) = "" {}
+        _FoamTex ("Whitewater density (R, model window, FoamLayer)", 2D) = "black" {}
+        _FoamDepthTex ("Whitewater front depth (R, sim units, 0 = none)", 2D) = "black" {}
+        _FoamOn ("Foam on", Float) = 0
+        _FoamOnly ("Foam only (fluid hidden)", Float) = 0
+        _FoamK ("Foam coverage k (1-exp(-k D))", Float) = 0.8
+        _FoamOpacity ("Foam max opacity", Float) = 1
+        _FoamColor ("Foam color (linear)", Vector) = (0.91, 0.96, 1.0, 0)
     }
 
     CGINCLUDE
@@ -192,8 +202,13 @@ Shader "Hidden/FluidSSFRScene"
             sampler2D _CameraOpaqueTexture;
             float4 _CameraOpaqueTexture_TexelSize;
             sampler2D _CameraDepthTexture;
+            float4 _ScaledScreenParams;   // URP global: camera target size AFTER render scale
             float _SimScale;
             float _DepthBias;   // world-units slack on the occlusion test (0 = unbiased)
+            sampler2D _FoamTex;        // bilinear
+            sampler2D _FoamDepthTex;   // point
+            float _FoamOn, _FoamOnly, _FoamK, _FoamOpacity;
+            float3 _FoamColor;
 
             struct appdata { float4 vertex : POSITION; };
             struct v2f
@@ -224,22 +239,33 @@ Shader "Hidden/FluidSSFRScene"
 
                 float4 c0 = tex2D(_CTex, uvm);
                 float a = c0.a;
-                clip(a - 0.004);
-                float inva = 1.0 / a;
+                // whitewater coverage (0 while the layer is off); sampled unconditionally, no gradients in branches
+                float fa = step(0.5, _FoamOn) * saturate(_FoamOpacity * (1.0 - exp(-_FoamK * tex2D(_FoamTex, uvm).r)));
+                clip(max(a, fa) - 0.004);
+                float inva = 1.0 / max(a, 1e-4);
 
                 // occlusion by scene geometry, per screen pixel (both eye-z along camera fwd);
-                // URP convention: screen UV = pixel coords / screen size (no flip)
-                float2 suv = i.pos.xy / _ScreenParams.xy;
+                // URP convention: screen UV = pixel coords / screen size (no flip). Divide by the
+                // SCALED size: i.pos is in render-scaled target pixels, _ScreenParams is unscaled
+                // (Mobile_RPAsset renderScale 0.8 otherwise squeezes suv into [0,0.8]).
+                float2 suv = i.pos.xy / _ScaledScreenParams.xy;
                 float4 c1 = tex2D(_MTex, uvm);
                 float worldD = c1.a * inva * _SimScale;
                 float sceneEye = LinearEyeDepth(tex2D(_CameraDepthTexture, suv).r);
-                clip(sceneEye - worldD + _DepthBias);
+                float fluidVis = (a >= 0.004 && sceneEye - worldD + _DepthBias >= 0.0) ? 1.0 : 0.0;
 
                 // refracted scene color; offset stored in screen texels, alpha-normalized
                 float2 duv = tex2D(_NTex, uvm).rg * inva * _CameraOpaqueTexture_TexelSize.xy;
                 float3 scene = tex2D(_CameraOpaqueTexture, saturate(suv + duv)).rgb;
+                float4 outc = fluidVis * (1.0 - _FoamOnly) * float4(scene * c1.rgb + c0.rgb, a);   // premultiplied
 
-                return float4(scene * c1.rgb + c0.rgb, a);   // premultiplied
+                // whitewater OVER the fluid: its own scene-occlusion test where it has a depth, else the fluid's
+                float fd = tex2D(_FoamDepthTex, uvm).r * _SimScale;
+                float foamVis = fd > 0.0 ? step(fd - _DepthBias, sceneEye) : (a >= 0.004 ? fluidVis : 1.0);
+                fa *= foamVis;
+                outc = float4(outc.rgb * (1.0 - fa) + _FoamColor * fa, outc.a * (1.0 - fa) + fa);
+                clip(outc.a - 1e-4);   // fluid behind scene geometry and no visible foam: nothing to draw
+                return outc;
             }
             ENDCG
         }

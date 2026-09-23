@@ -23,7 +23,12 @@
 // against the panel's fluid depth (visible if in front within 4 r_w, else a hidden bubble at 0.12 weight);
 // weights spray 0.6 / foam 1.0 / bubble 0.5; separable Gaussian sigma 1 px; the shader turns density into
 // coverage 1 - exp(-k D). CHW row convention (row 0 = top) like every other buffer here.
+// Optional frontDepth output (FluidSceneMVP): nearest VISIBLE whitewater depth per pixel (0 = none), min-dilated
+// over the blur footprint, so the scene composite can occlude spray that is off the fluid surface.
+// Every constant of the probe is a public field below; the defaults are the tested values.
 using System;
+using System.Collections.Concurrent;
+using System.Threading.Tasks;
 using UnityEngine;
 
 public sealed class FoamLayer
@@ -33,15 +38,34 @@ public sealed class FoamLayer
     public float lifeMin = 1f, lifeMax = 4f;
     public float tauDecay = 0.98f;
     public int maxDiffuse = 30000;
-    public float spriteScale = 1f;          // multiplier on the per-particle disk footprint (0 = single pixel)
     public Vector3 gravity = new Vector3(0f, -9.81f, 0f);
     public float floorY = -0.05f;
     public Vector3 domainMin = new Vector3(-1f, -0.1f, -1f), domainMax = new Vector3(4f, 4f, 4f);
-    const float SurfFrac = 0.75f, SprayFrac = 0.15f, BubbleFrac = 0.60f, KB = 0.5f, KD = 0.7f;
-    const float TauKMin = 0.5f * 1f * 1f, TauKMax = 0.5f * 3f * 3f;
+    // potentials / classification
+    public float surfaceFrac = 0.75f, sprayFrac = 0.15f, bubbleFrac = 0.60f;   // fractions of n_full
+    public float nFullPercentile = 0.90f;
+    public float crestMinVelDotN = 0.6f;              // wave crest only where v^.n >= this
+    public float tauPercentile = 0.995f;              // running tau = max(decayed tau, this percentile of the frame)
+    public float tauMinFrac = 0.25f;                  // Phi ramps from tauMinFrac*tau to tau
+    public float kineticMinSpeed = 1f, kineticMaxSpeed = 3f;   // Phi_k ramps over 0.5 v^2 between these speeds
+    // diffuse dynamics
+    public float buoyancy = 0.5f, drag = 0.7f;        // bubble k_b, k_d
+    public float sprayMaxAge = 3f, orphanMaxAge = 1f; // cull spray older than this / anything with no fluid nearby
+    // splat
+    public float spriteScale = 1f;                    // multiplier on the per-particle disk footprint (0 = single pixel)
+    public float spraySprite = 0.33f, foamSprite = 0.5f;   // footprint radius as a fraction of the projected r_w
+    public int maxSpritePx = 3;
+    public float weightSpray = 0.6f, weightFoam = 1f, weightBubble = 0.5f;
+    public float hiddenWeight = 0.12f;                // weight multiplier for particles behind the fluid surface
+    public float depthTolR = 4f;                      // "in front" = within depthTolR * r_w behind the fluid depth
+    public bool blur = true;                          // separable Gaussian sigma 1 px on the density
+    // Neighbour passes, the diffuse update and the blur run across cores. Every parallel loop writes only
+    // its own index/row, and spawning (the only RNG user) stays sequential, so results match single-threaded.
+    public bool multithreaded = true;
 
     // ---- diffuse state (struct-of-arrays, compacted in place) ----
     Vector3[] dPos, dVel; float[] dLife, dAge; byte[] dTyp; int n;
+    bool[] dAlive = new bool[0];
     // ---- fluid scratch ----
     // open-addressing hash grid: hKeys[slot] = cell key (or Empty), hHead[slot] = first particle in that cell
     long[] hKeys = new long[0]; int[] hHead = new int[0]; int hMask;
@@ -69,6 +93,14 @@ public sealed class FoamLayer
         dPos = new Vector3[maxDiffuse]; dVel = new Vector3[maxDiffuse];
         dLife = new float[maxDiffuse]; dAge = new float[maxDiffuse]; dTyp = new byte[maxDiffuse];
         n = 0;
+    }
+
+    // cap changed at runtime: keep the live particles (the newest ones if shrinking below n)
+    void Resize()
+    {
+        if (n > maxDiffuse) DropOldest(n - maxDiffuse);
+        Array.Resize(ref dPos, maxDiffuse); Array.Resize(ref dVel, maxDiffuse);
+        Array.Resize(ref dLife, maxDiffuse); Array.Resize(ref dAge, maxDiffuse); Array.Resize(ref dTyp, maxDiffuse);
     }
 
     public void Reset() { n = 0; tauTa = 0f; tauWc = 0f; Spray = Foam = Bubble = SpawnedTa = SpawnedWc = 0; }
@@ -112,11 +144,18 @@ public sealed class FoamLayer
 
     static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
 
+    // body(i0, i1) over [0, n) in chunks of `grain`, in parallel when multithreaded
+    void ForRange(int n, int grain, Action<int, int> body)
+    {
+        if (!multithreaded || n < 2 * grain) { body(0, n); return; }
+        Parallel.ForEach(Partitioner.Create(0, n, grain), r => body(r.Item1, r.Item2));
+    }
+
     // ---------- fluid potentials + diffuse update + spawn ----------
     public void Step(float[] data, int off, int count, float rW, float dt)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        if (dPos.Length != maxDiffuse) Allocate();
+        if (dPos.Length != maxDiffuse) Resize();
         float h = 4f * rW, h2 = h * h, inv = 1f / h;
         if (fPos.Length < count)
         {
@@ -132,7 +171,8 @@ public sealed class FoamLayer
         BuildGrid(count, h);
 
         // pass A: counts, trapped air, normals
-        for (int i = 0; i < count; i++)
+        ForRange(count, 256, (i0, i1) => {
+        for (int i = i0; i < i1; i++)
         {
             Vector3 pi = fPos[i], vi = fVel[i], nn = Vector3.zero;
             int c = 0; float ta = 0f;
@@ -159,18 +199,20 @@ public sealed class FoamLayer
             cnt[i] = c; ITa[i] = ta;
             float nm = nn.magnitude; nrm[i] = nm > 1e-9f ? nn / nm : Vector3.up;
         }
+        });
         // n_full = 90th percentile of counts
         for (int i = 0; i < count; i++) scratch[i] = cnt[i];
-        NFull = Mathf.Max(Percentile(scratch, count, 0.90f), 4f);
-        for (int i = 0; i < count; i++) surface[i] = cnt[i] < SurfFrac * NFull;
+        NFull = Mathf.Max(Percentile(scratch, count, nFullPercentile), 4f);
+        for (int i = 0; i < count; i++) surface[i] = cnt[i] < surfaceFrac * NFull;
 
         // pass B: wave crest on surface particles moving along their normal
-        for (int i = 0; i < count; i++)
+        ForRange(count, 256, (i0, i1) => {
+        for (int i = i0; i < i1; i++)
         {
             IWc[i] = 0f;
             if (!surface[i]) continue;
             Vector3 vi = fVel[i]; float vm = vi.magnitude;
-            if (vm < 1e-6f || Vector3.Dot(vi / vm, nrm[i]) < 0.6f) continue;
+            if (vm < 1e-6f || Vector3.Dot(vi / vm, nrm[i]) < crestMinVelDotN) continue;
             Vector3 pi = fPos[i], ni = nrm[i]; float wc = 0f;
             int cx = (int)Math.Floor(pi.x * inv), cy = (int)Math.Floor(pi.y * inv), cz = (int)Math.Floor(pi.z * inv);
             for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++)
@@ -189,13 +231,14 @@ public sealed class FoamLayer
             }
             IWc[i] = wc;
         }
+        });
 
         // running calibration of tau (99.5th percentile, slow decay)
         for (int i = 0; i < count; i++) scratch[i] = ITa[i];
-        float pTa = Percentile(scratch, count, 0.995f);
+        float pTa = Percentile(scratch, count, tauPercentile);
         tauTa = Mathf.Max(tauTa * tauDecay, pTa);
         int m = 0; for (int i = 0; i < count; i++) if (IWc[i] > 0f) scratch[m++] = IWc[i];
-        if (m >= 20) tauWc = Mathf.Max(tauWc * tauDecay, Percentile(scratch, m, 0.995f));
+        if (m >= 20) tauWc = Mathf.Max(tauWc * tauDecay, Percentile(scratch, m, tauPercentile));
         else tauWc *= tauDecay;
 
         // diffuse update in this frame's field (before spawning, as Python)
@@ -205,12 +248,14 @@ public sealed class FoamLayer
         SpawnedTa = SpawnedWc = 0;
         if (dt > 0f && tauTa > 1e-9f)
         {
-            float tTaMax = tauTa * tauScale, tTaMin = 0.25f * tTaMax;
-            float tWcMax = tauWc * tauScale, tWcMin = 0.25f * tWcMax;
+            float tTaMax = tauTa * tauScale, tTaMin = tauMinFrac * tTaMax;
+            float tWcMax = tauWc * tauScale, tWcMin = tauMinFrac * tWcMax;
+            float kMin = 0.5f * kineticMinSpeed * kineticMinSpeed, kMax = 0.5f * kineticMaxSpeed * kineticMaxSpeed;
+            float kInv = 1f / Mathf.Max(kMax - kMin, 1e-6f);
             for (int i = 0; i < count; i++)
             {
                 float ek = 0.5f * fVel[i].sqrMagnitude;
-                float phiK = Clamp01((ek - TauKMin) / (TauKMax - TauKMin));
+                float phiK = Clamp01((ek - kMin) * kInv);
                 if (phiK <= 0f) continue;
                 float phiTa = Clamp01((ITa[i] - tTaMin) / Mathf.Max(tTaMax - tTaMin, 1e-12f));
                 float phiWc = tWcMax > 1e-9f ? Clamp01((IWc[i] - tWcMin) / Mathf.Max(tWcMax - tWcMin, 1e-12f)) : 0f;
@@ -272,8 +317,10 @@ public sealed class FoamLayer
 
     void UpdateDiffuse(int count, float h, float h2, float inv, float dt)
     {
-        int w = 0;
-        for (int p = 0; p < n; p++)
+        // advance every particle in place (parallel: each writes only its own slot), then compact the survivors
+        if (dAlive.Length < n) dAlive = new bool[dPos.Length];
+        ForRange(n, 512, (p0, p1) => {
+        for (int p = p0; p < p1; p++)
         {
             Vector3 x = dPos[p];
             int cx = (int)Math.Floor(x.x * inv), cy = (int)Math.Floor(x.y * inv), cz = (int)Math.Floor(x.z * inv);
@@ -292,21 +339,27 @@ public sealed class FoamLayer
             }
             bool hasF = wsum > 0f;
             if (hasF) vf /= wsum;
-            byte typ = c < SprayFrac * NFull ? (byte)0 : (c > BubbleFrac * NFull ? (byte)2 : (byte)1);
+            byte typ = c < sprayFrac * NFull ? (byte)0 : (c > bubbleFrac * NFull ? (byte)2 : (byte)1);
             if (!hasF) typ = 0;
             Vector3 v = dVel[p];
             if (typ == 0) v += gravity * dt;
             else if (typ == 1) v = vf;
-            else v += (-KB * gravity) * dt + KD * (vf - v);
+            else v += (-buoyancy * gravity) * dt + drag * (vf - v);
             x += v * dt;
             float life = dLife[p] - (typ == 1 ? dt : 0f);
             float age = dAge[p] + dt;
-            bool alive = life > 0f && x.y > floorY
-                         && x.x > domainMin.x && x.y > domainMin.y && x.z > domainMin.z
-                         && x.x < domainMax.x && x.y < domainMax.y && x.z < domainMax.z
-                         && !(typ == 0 && age > 3f) && !(!hasF && age > 1f);
-            if (!alive) continue;
-            dPos[w] = x; dVel[w] = v; dLife[w] = life; dAge[w] = age; dTyp[w] = typ;
+            dAlive[p] = life > 0f && x.y > floorY
+                        && x.x > domainMin.x && x.y > domainMin.y && x.z > domainMin.z
+                        && x.x < domainMax.x && x.y < domainMax.y && x.z < domainMax.z
+                        && !(typ == 0 && age > sprayMaxAge) && !(!hasF && age > orphanMaxAge);
+            dPos[p] = x; dVel[p] = v; dLife[p] = life; dAge[p] = age; dTyp[p] = typ;
+        }
+        });
+        int w = 0;
+        for (int p = 0; p < n; p++)
+        {
+            if (!dAlive[p]) continue;
+            if (w != p) { dPos[w] = dPos[p]; dVel[w] = dVel[p]; dLife[w] = dLife[p]; dAge[w] = dAge[p]; dTyp[w] = dTyp[p]; }
             w++;
         }
         n = w;
@@ -322,30 +375,41 @@ public sealed class FoamLayer
 
     // ---------- screen-space density (CHW, row 0 = top) ----------
     // fluidDepth: per-pixel front depth in world units (0 = background) of the panel this layer is drawn over.
+    // frontDepth (optional, same layout): receives the nearest visible whitewater depth, 0 = none.
+    // aspect: window W/H for a non-square window (SplatV2's projection); 1 = the square window.
     public void Splat(Vector3 eye, Vector3 right, Vector3 up, Vector3 fwd, float focal, int H, int W,
-                      float[] fluidDepth, float rW, float[] density, float[] tmp)
+                      float[] fluidDepth, float rW, float[] density, float[] tmp,
+                      float[] frontDepth = null, float aspect = 1f)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         Array.Clear(density, 0, H * W);
-        float tol = 4f * rW;
+        if (frontDepth != null) Array.Clear(frontDepth, 0, H * W);
+        float tol = depthTolR * rW;
+        int maxR = Math.Max(maxSpritePx, 0);
         for (int p = 0; p < n; p++)
         {
             Vector3 r = dPos[p] - eye;
             float cx = Vector3.Dot(r, right), cy = Vector3.Dot(r, up), cz = -Vector3.Dot(r, fwd);
             float depth = -cz;
             if (!(depth > 1e-3f)) continue;
-            int px = (int)Math.Floor((focal * cx / depth + 1f) * 0.5f * W);
+            int px = (int)Math.Floor((focal * cx / depth / aspect + 1f) * 0.5f * W);
             int py = (int)Math.Floor((1f - focal * cy / depth) * 0.5f * H);
             if (px < 0 || px >= W || py < 0 || py >= H) continue;
             int i = py * W + px;
             float fd = fluidDepth[i];
             bool front = fd <= 0f || depth <= fd + tol;
-            float wt = dTyp[p] == 0 ? 0.6f : (dTyp[p] == 1 ? 1f : 0.5f);
-            wt = front ? wt : 0.12f * wt;
-            // footprint: a disk of half the projected coarse radius (spray a third), 0..3 px; weight spread over it
-            float rp = (dTyp[p] == 0 ? 0.33f : 0.5f) * rW * focal * (H * 0.5f) / depth * spriteScale;
-            int R = rp < 0.75f ? 0 : (rp > 3f ? 3 : (int)Math.Round(rp));
-            if (R == 0) { density[i] += wt; continue; }
+            float wt = dTyp[p] == 0 ? weightSpray : (dTyp[p] == 1 ? weightFoam : weightBubble);
+            wt = front ? wt : hiddenWeight * wt;
+            bool writeDepth = front && frontDepth != null;
+            // footprint: a disk of half the projected coarse radius (spray a third), 0..maxSpritePx; weight spread over it
+            float rp = (dTyp[p] == 0 ? spraySprite : foamSprite) * rW * focal * (H * 0.5f) / depth * spriteScale;
+            int R = rp < 0.75f ? 0 : (rp > maxR ? maxR : (int)Math.Round(rp));
+            if (R == 0)
+            {
+                density[i] += wt;
+                if (writeDepth && (frontDepth[i] <= 0f || depth < frontDepth[i])) frontDepth[i] = depth;
+                continue;
+            }
             int R2 = R * R, area = 0;
             for (int oy = -R; oy <= R; oy++) for (int ox = -R; ox <= R; ox++) if (ox * ox + oy * oy <= R2) area++;
             float wa = wt / area;
@@ -355,13 +419,21 @@ public sealed class FoamLayer
                 for (int ox = -R; ox <= R; ox++)
                 {
                     int tx = px + ox; if (tx < 0 || tx >= W || ox * ox + oy * oy > R2) continue;
-                    density[ty * W + tx] += wa;
+                    int t = ty * W + tx;
+                    density[t] += wa;
+                    if (writeDepth && (frontDepth[t] <= 0f || depth < frontDepth[t])) frontDepth[t] = depth;
                 }
             }
         }
+        if (!blur)
+        {
+            sw.Stop(); LastSplatMs = (float)sw.Elapsed.TotalMilliseconds;
+            return;
+        }
         // separable Gaussian sigma 1 px (5 taps)
         float k0 = 0.40262f, k1 = 0.24420f, k2 = 0.05449f;
-        for (int y = 0; y < H; y++)
+        ForRange(H, 16, (y0, y1) => {
+        for (int y = y0; y < y1; y++)
         {
             int row = y * W;
             for (int x = 0; x < W; x++)
@@ -374,7 +446,9 @@ public sealed class FoamLayer
                 tmp[row + x] = s;
             }
         }
-        for (int y = 0; y < H; y++)
+        });
+        ForRange(H, 16, (y0, y1) => {
+        for (int y = y0; y < y1; y++)
             for (int x = 0; x < W; x++)
             {
                 float s = tmp[y * W + x] * k0;
@@ -384,6 +458,42 @@ public sealed class FoamLayer
                 if (y + 2 < H) s += tmp[(y + 2) * W + x] * k2;
                 density[y * W + x] = s;
             }
+        });
+        // the blur spreads density 2 px past the footprint: give that halo a depth too (min over 5x5, 0 = none)
+        if (frontDepth != null) DilateMin(frontDepth, tmp, H, W, 2);
         sw.Stop(); LastSplatMs = (float)sw.Elapsed.TotalMilliseconds;
+    }
+
+    void DilateMin(float[] d, float[] tmp, int H, int W, int R)
+    {
+        ForRange(H, 16, (y0, y1) => {
+        for (int y = y0; y < y1; y++)
+        {
+            int row = y * W;
+            for (int x = 0; x < W; x++)
+            {
+                float m = 0f;
+                for (int o = Math.Max(x - R, 0), e = Math.Min(x + R, W - 1); o <= e; o++)
+                {
+                    float v = d[row + o];
+                    if (v > 0f && (m <= 0f || v < m)) m = v;
+                }
+                tmp[row + x] = m;
+            }
+        }
+        });
+        ForRange(H, 16, (y0, y1) => {
+        for (int y = y0; y < y1; y++)
+            for (int x = 0; x < W; x++)
+            {
+                float m = 0f;
+                for (int o = Math.Max(y - R, 0), e = Math.Min(y + R, H - 1); o <= e; o++)
+                {
+                    float v = tmp[o * W + x];
+                    if (v > 0f && (m <= 0f || v < m)) m = v;
+                }
+                d[y * W + x] = m;
+            }
+        });
     }
 }

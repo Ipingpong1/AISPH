@@ -116,7 +116,7 @@ public class GpuSphProvider : ParticleFrameProvider
         EnsureInit();
         if (dt <= 0f) return;
         var kb = Keyboard.current;
-        if (kb != null && kb.fKey.wasPressedThisFrame) { solver.SpawnBlock(blockMin, blockCount); recordsDirty = true; }
+        if (kb != null && kb.fKey.wasPressedThisFrame) DropBlock();
         if (autoDropInterval > 0f)
         {
             timeSinceDrop += dt;
@@ -145,6 +145,14 @@ public class GpuSphProvider : ParticleFrameProvider
         }
         sw.Stop();
         lastStepMs = (float)sw.Elapsed.TotalMilliseconds;   // dispatch + vmax readback, not GPU time
+    }
+
+    /// <summary>Spawn another block of fluid (the F key).</summary>
+    public void DropBlock()
+    {
+        EnsureInit();
+        solver.SpawnBlock(blockMin, blockCount);
+        recordsDirty = true;
     }
 
     public override void ResetSim()

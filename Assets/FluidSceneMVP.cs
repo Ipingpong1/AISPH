@@ -32,9 +32,10 @@
 //
 // Controls (when flyControls is on): WASD fly (+Q/E world down/up, Shift ×3), hold RMB +
 // mouse to look, P pause, R restart, V shade raw model input instead of the prediction,
-// B bilateral smoothing, [ / ] playback fps −/+5.
+// B bilateral smoothing, [ / ] playback fps −/+5, G whitewater layer (FoamLayer), H whitewater only.
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.InputSystem;
@@ -71,8 +72,12 @@ public class FluidSceneMVP : MonoBehaviour
     [Header("Inference")]
     [Tooltip("Inference Engine backend. 2026-09-21 (067, ledger A4): GPUCompute fp32 AND GPUPixel fp32 both match onnxruntime on 053a / 060a / 058c and the wide models (max |d| < 1e-3, identical occupancy mask) on Inference Engine 2.6.1 — the older 'GPUCompute is silently wrong' warning no longer holds for these models.")]
     public BackendType backend = BackendType.GPUPixel;
-    [Tooltip("Attempt fp16 weight quantization (auto-falls back to fp32 on failure). Recommended default: true.")]
+    [Tooltip("Attempt fp16 weight quantization (auto-falls back to fp32 on failure). NOTE (IE 2.6.1 source, QuantizeConstantsPass): this only STORES conv weights as fp16 and inserts a Cast back to float in front of each conv — the math stays fp32, so it shrinks the model but does not make inference faster.")]
     public bool useFp16 = true;
+    [Tooltip("0 = synchronous: every rendered frame splats, runs the whole network and blocks on the readback (the research/recording default). N > 0 = spread each inference over ~N rendered frames (Worker.ScheduleIterable, ~1/N of the layers per frame) and fetch the result with an async readback: the scene, camera and stirrer render at the full frame rate and the fluid updates whenever a prediction lands (the composite keeps it world-locked through camera rotation). Forced to 0 while capturing or while LiveClipRecorder listens.")]
+    [Min(0)] public int spreadFrames = 0;
+    [Tooltip("Spread Frames used instead on phones/tablets (Application.isMobilePlatform). iPhone 16 Pro / 067b: ~84 ms per synchronous inference, so 3 = ~28 ms of network per frame.")]
+    [Min(0)] public int spreadFramesMobile = 3;
     [Tooltip("Manual override for the shader thickness scale (_KThick). 0 = auto-derive from the model's own predicted thickness. Recommended default: 0 (auto).")]
     public float kThickOverride = 0f;
 
@@ -165,6 +170,88 @@ public class FluidSceneMVP : MonoBehaviour
     [Tooltip("Reflection fallback ground color for downward rays when no probe is available.")]
     public Color fallbackGround = new Color(0.16f, 0.19f, 0.24f);
 
+    [Header("Foam / whitewater (059 compositor layer, key G) — off by default")]
+    [Tooltip("Draw Ihmsen-style spray/foam/bubbles generated from the provider's particle frame (FoamLayer.cs, the in-engine port of the 059 probe) over the fluid. Pure compositor: no network output involved. Diffuse particles are drawn in the model window from the splat camera, depth-tested against the predicted fluid depth, and (where they have their own depth) against the scene depth. Toggle at runtime with G.")]
+    public bool foamEnabled = false;
+    [Tooltip("Show ONLY the whitewater layer (the fluid is not composited) — for tuning, or to show the audience what the layer adds. Toggle at runtime with H.")]
+    public bool foamOnlyView = false;
+    [Tooltip("Particle radius the layer uses for its neighbour support (h = 4 r), spawn cylinder and sprite size. 0 = provider.ParticleRadius (GpuSphProvider 0.0414), then the stats meta's coarseRadius.")]
+    public float foamRadiusOverride = 0f;
+
+    [Header("Foam — spawning (Ihmsen potentials)")]
+    [Tooltip("Spawn rate multiplier (the probe's mass factor). Higher = more whitewater. Tested: 20.")]
+    public float foamSpawnScale = 20f;
+    [Tooltip("Trapped-air rate k_ta (spawns inside turbulent / colliding flow). Tested: 8.")]
+    public float foamKTa = 8f;
+    [Tooltip("Wave-crest rate k_wc (spawns on convex crests moving outward). Tested: 12.")]
+    public float foamKWc = 12f;
+    [Tooltip("Multiplier on the running potential calibration tau. Lower = potentials saturate sooner = more, earlier foam. Tested: 1.")]
+    public float foamTauScale = 1f;
+    [Tooltip("Per-step decay of the running tau (tau = max(tau * decay, this frame's percentile)). On the live GPU solver one step = one solver frame (1/simHz); on baked playback one rendered frame. Closer to 1 = the biggest splash keeps setting the scale longer (less foam from later, smaller events). Tested: 0.98.")]
+    [Range(0.8f, 1f)] public float foamTauDecay = 0.98f;
+    [Tooltip("Percentile of this frame's potentials that feeds the running tau. Lower = tau lower = more particles spawn. Tested: 0.995.")]
+    [Range(0.5f, 1f)] public float foamTauPercentile = 0.995f;
+    [Tooltip("Potential clamp: Phi ramps from (this x tau) to tau. Lower = weaker potentials spawn too. Tested: 0.25.")]
+    [Range(0f, 0.95f)] public float foamTauMinFrac = 0.25f;
+    [Tooltip("Kinetic gate (m/s): no spawning below x, full rate above y (ramped over 0.5 v^2). Lower it if stirring does not produce foam; the dam drop reaches ~5 m/s. Tested: (1, 3).")]
+    public Vector2 foamKineticSpeed = new Vector2(1f, 3f);
+    [Tooltip("Wave crest only counts where the particle moves along its surface normal: v^.n >= this. Tested: 0.6.")]
+    [Range(-1f, 1f)] public float foamCrestMinVelDotN = 0.6f;
+    [Tooltip("A fluid particle is a SURFACE particle (eligible for wave crests) below this fraction of n_full neighbours. Tested: 0.75.")]
+    [Range(0f, 1f)] public float foamSurfaceFrac = 0.75f;
+    [Tooltip("n_full = this percentile of the fluid neighbour counts (the 'fully immersed' count all fractions refer to). Tested: 0.9.")]
+    [Range(0.5f, 1f)] public float foamNFullPercentile = 0.9f;
+
+    [Header("Foam — diffuse particles")]
+    [Tooltip("Cap on live diffuse particles; the oldest are dropped when full. Tested: 30000.")]
+    public int foamMaxDiffuse = 30000;
+    [Tooltip("Foam particle lifetime range in seconds (scaled by 0.5 + 0.5 Phi_k at spawn; ticks only while classified as foam). Tested: (1, 4).")]
+    public Vector2 foamLifetime = new Vector2(1f, 4f);
+    [Tooltip("Classified as SPRAY (ballistic) below this fraction of n_full fluid neighbours. Tested: 0.15.")]
+    [Range(0f, 1f)] public float foamSprayFrac = 0.15f;
+    [Tooltip("Classified as BUBBLE (buoyant + drag) above this fraction of n_full fluid neighbours; foam in between. Tested: 0.6.")]
+    [Range(0f, 1f)] public float foamBubbleFrac = 0.6f;
+    [Tooltip("Bubble buoyancy k_b (multiple of -gravity). Tested: 0.5.")]
+    public float foamBuoyancy = 0.5f;
+    [Tooltip("Bubble drag k_d towards the local fluid velocity, per step. Tested: 0.7.")]
+    [Range(0f, 1f)] public float foamDrag = 0.7f;
+    [Tooltip("Gravity for spray/bubbles in sim space. Tested: (0, -9.81, 0).")]
+    public Vector3 foamGravity = new Vector3(0f, -9.81f, 0f);
+    [Tooltip("Spray older than this (s) is culled. Tested: 3.")]
+    public float foamSprayMaxAge = 3f;
+    [Tooltip("Particles with no fluid within h older than this (s) are culled. Tested: 1.")]
+    public float foamOrphanMaxAge = 1f;
+    [Tooltip("Particles below this sim-space y are culled (the sim floor is y = 0). Tested: -0.05.")]
+    public float foamFloorY = -0.05f;
+    [Tooltip("Particles outside this sim-space box are culled. Tested: (-1,-0.1,-1)..(4,4,4) around the [0,3]^3 domain.")]
+    public Vector3 foamDomainMin = new Vector3(-1f, -0.1f, -1f), foamDomainMax = new Vector3(4f, 4f, 4f);
+
+    [Header("Foam — rendering")]
+    [Tooltip("Whitewater colour (sRGB).")]
+    public Color foamColor = new Color(0.96f, 0.98f, 1f, 1f);
+    [Tooltip("Multiplier on the whitewater colour (can exceed 1 for HDR/bloom).")]
+    public float foamBrightness = 1f;
+    [Tooltip("0 = flat colour (as tested); 1 = colour x the main directional light's colour x intensity, so foam dims with the scene lighting.")]
+    [Range(0f, 1f)] public float foamLightInfluence = 0f;
+    [Tooltip("Density -> coverage: 1 - exp(-k D). Higher = denser-looking foam from the same particles. Tested: 0.8.")]
+    public float foamCoverageK = 0.8f;
+    [Tooltip("Max opacity of the whitewater layer.")]
+    [Range(0f, 1f)] public float foamOpacity = 1f;
+    [Tooltip("Multiplier on each particle's disk footprint (0 = single pixel). Tested: 1.")]
+    public float foamSpriteScale = 1f;
+    [Tooltip("Footprint radius as a fraction of the projected particle radius: x = spray, y = foam/bubbles. Tested: (0.33, 0.5).")]
+    public Vector2 foamSpriteFrac = new Vector2(0.33f, 0.5f);
+    [Tooltip("Largest footprint radius in model-window pixels. Tested: 3.")]
+    [Range(0, 8)] public int foamMaxSpritePx = 3;
+    [Tooltip("Density weight per type: x = spray, y = foam, z = bubble. Tested: (0.6, 1, 0.5).")]
+    public Vector3 foamTypeWeights = new Vector3(0.6f, 1f, 0.5f);
+    [Tooltip("Weight multiplier for particles BEHIND the predicted fluid surface (bubbles seen through the water). 0 = hide them. Tested: 0.12.")]
+    [Range(0f, 1f)] public float foamHiddenWeight = 0.12f;
+    [Tooltip("A particle counts as in front of the fluid if it is within this many particle radii behind the predicted surface. Tested: 4.")]
+    public float foamDepthTolR = 4f;
+    [Tooltip("Separable Gaussian (sigma 1 px) on the density. Off = crisper, noisier specks. Tested: on.")]
+    public bool foamBlur = true;
+
     [Header("Controls / debug")]
     [Tooltip("Built-in fly controls for the target camera (WASD/QE + RMB look). Turn off if the scene has its own camera controller.")]
     public bool flyControls = true;
@@ -207,6 +294,14 @@ public class FluidSceneMVP : MonoBehaviour
 
     Worker worker;
     bool fp16Active;
+    // spread inference (ActiveSpread > 0)
+    IEnumerator pendingSchedule;           // ScheduleIterable in flight; null once every layer is scheduled
+    Tensor<float> pendingInput;            // its input, disposed once the prediction has been read back
+    bool awaitingReadback;
+    int modelLayerCount = 1;
+    readonly System.Diagnostics.Stopwatch pendingSw = new System.Diagnostics.Stopwatch();
+    float fluidHz, lastPredTime = -1f;
+    Vector3 shadeRightWS, shadeUpWS, shadeFwdWS;   // world camera basis of the splat the current prediction came from
     float kThick;
     float thickScale = 1f;                 // particle-count normalization for the thickness channel (legacy only)
     bool useV2; float v2R, v2TS, v2MinR = 1f, v2MaxR = 24f;
@@ -227,7 +322,14 @@ public class FluidSceneMVP : MonoBehaviour
     public event Action OnShaded;
     float bilateralSigmaR;
     GameObject quadGO;
+    MeshRenderer quadMR;
     Light mainLight;
+
+    // 059 whitewater layer (CPU): stepped when a particle frame is splatted, drawn when its prediction lands
+    FoamLayer foam;
+    float[] foamFluidDepth, foamDen, foamFront, foamTmp, foamStage;   // CHW, row 0 = top
+    Texture2D foamTex, foamDepthTex;                                   // texture rows (row 0 = bottom)
+    float lastFoamClock;
 
     // camera pose in sim space, rebuilt each frame
     Vector3 eyeSim, rightSim, upSim, fwdSim;
@@ -258,6 +360,21 @@ public class FluidSceneMVP : MonoBehaviour
         ComputeSimCamera();   // pure function of the transforms; the camera is final by LateUpdate
         eye = eyeSim; right = rightSim; up = upSim; fwd = fwdSim; focal = focalM;
     }
+
+    // ---------- runtime controls (keyboard in HandleInput, TouchControls on phones) ----------
+    public Camera TargetCamera => targetCamera;
+    public bool Paused => paused;
+    public bool ShowingRawInput => showRawInput;
+    public void TogglePause() => paused = !paused;
+    public void ToggleRawInput() => showRawInput = !showRawInput;
+    public void ToggleBilateral() => bilateralSmoothing = !bilateralSmoothing;
+    public void ResetSim() { simTime = 0f; provider?.ResetSim(); hasHistory = false; foam?.Reset(); lastFoamClock = 0f; }
+    public bool FoamEnabled => foamEnabled;
+    public void ToggleFoam() { foamEnabled = !foamEnabled; if (foamEnabled) foam?.Reset(); }
+    public void ToggleFoamOnlyView() => foamOnlyView = !foamOnlyView;
+    /// <summary>Spread actually in use this frame (0 = synchronous).</summary>
+    public int ActiveSpread => capturing || OnInferred != null || OnShaded != null ? 0
+        : Mathf.Max(0, Application.isMobilePlatform ? spreadFramesMobile : spreadFrames);
 
     [Serializable]
     public class ClipSettings
@@ -357,6 +474,12 @@ public class FluidSceneMVP : MonoBehaviour
         in7 = new float[7 * HW];
         px = new Color[HW];
 
+        foam = new FoamLayer();
+        foamFluidDepth = new float[HW]; foamDen = new float[HW]; foamFront = new float[HW];
+        foamTmp = new float[HW]; foamStage = new float[HW];
+        foamTex = new Texture2D(W, H, TextureFormat.RFloat, false) { filterMode = FilterMode.Bilinear, wrapMode = TextureWrapMode.Clamp };
+        foamDepthTex = new Texture2D(W, H, TextureFormat.RFloat, false) { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+
         if (smoothShader == null) smoothShader = Shader.Find("Hidden/FluidSSFR");
         if (smoothShader == null) throw new Exception("Hidden/FluidSSFR shader not found");
         if (sceneShader == null) sceneShader = Shader.Find("Hidden/FluidSSFRScene");
@@ -396,6 +519,8 @@ public class FluidSceneMVP : MonoBehaviour
         quadGO.transform.localPosition = new Vector3(0, 0, qz);
         quadGO.transform.localScale = new Vector3(5f * qz, 5f * qz, 1f);
         var mr = quadGO.GetComponent<MeshRenderer>();
+        quadMR = mr;
+        mr.enabled = false;   // until the first prediction is shaded (a spread inference lands a few frames in)
         mr.sharedMaterial = compositeMat;
         mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
         mr.receiveShadows = false;
@@ -417,8 +542,8 @@ public class FluidSceneMVP : MonoBehaviour
             }
         }
         worker = new Worker(model, backend);
-        ComputeSimCamera();
-        SplatToInput(0);
+        modelLayerCount = Mathf.Max(1, model.layers.Count);
+        BeginInference();
         try { RunModel(); }
         catch (Exception e) when (fp16Active)
         {
@@ -465,6 +590,63 @@ public class FluidSceneMVP : MonoBehaviour
         worker.Schedule(input);
         using var t = (worker.PeekOutput() as Tensor<float>).ReadbackAndClone();
         return t.DownloadToArray();
+    }
+
+    // Splat the current frame from the current camera and remember that camera's world basis:
+    // the shading packs and the composite must use the pose the prediction was made from.
+    void BeginInference()
+    {
+        ComputeSimCamera();
+        SplatToInput(frameIdx);
+        StepFoam();
+        Transform c = targetCamera.transform;
+        shadeRightWS = c.right; shadeUpWS = c.up; shadeFwdWS = c.forward;
+    }
+
+    // One rendered frame of a spread inference: start one if idle, schedule ~1/spread of the
+    // layers, and shade the prediction once its async readback has landed.
+    void StepSpreadInference(int spread)
+    {
+        if (pendingSchedule == null && !awaitingReadback)
+        {
+            BeginInference();
+            pendingInput = new Tensor<float>(new TensorShape(1, 7, H, W), in7);
+            pendingSchedule = worker.ScheduleIterable(pendingInput);
+            pendingSw.Restart();
+        }
+        if (pendingSchedule != null)
+        {
+            int n = Mathf.CeilToInt(modelLayerCount / (float)spread);
+            for (int k = 0; k < n; k++)
+                if (!pendingSchedule.MoveNext())
+                {
+                    pendingSchedule = null;
+                    worker.PeekOutput().ReadbackRequest();
+                    awaitingReadback = true;
+                    break;
+                }
+        }
+        if (awaitingReadback && worker.PeekOutput().IsReadbackRequestDone())
+        {
+            float[] pred;
+            using (var t = (worker.PeekOutput() as Tensor<float>).ReadbackAndClone())   // served from the finished async request
+                pred = t.DownloadToArray();
+            awaitingReadback = false;
+            pendingInput.Dispose(); pendingInput = null;
+            float ms = (float)pendingSw.Elapsed.TotalMilliseconds;   // splat -> prediction landed (latency, not GPU time)
+            inferMs = inferMs <= 0f ? ms : Mathf.Lerp(inferMs, ms, 0.2f);
+            ProcessPrediction(pred);
+        }
+    }
+
+    // Finish and discard an in-flight spread inference (switching to synchronous mid-flight).
+    void DrainPending()
+    {
+        if (pendingSchedule == null && !awaitingReadback && pendingInput == null) return;
+        if (pendingSchedule != null) while (pendingSchedule.MoveNext()) { }
+        using (var t = (worker.PeekOutput() as Tensor<float>).ReadbackAndClone()) { }   // wait for the GPU before freeing the input
+        pendingSchedule = null; awaitingReadback = false;
+        pendingInput?.Dispose(); pendingInput = null;
     }
 
     // ---------- camera pose: Unity world -> sim space ----------
@@ -601,16 +783,33 @@ public class FluidSceneMVP : MonoBehaviour
         provider.Tick(paused ? 0f : dt * speed);   // live solvers advance in lockstep
         frameIdx = (int)(simTime * playbackFps) % provider.FrameCount;
 
-        ComputeSimCamera();
-        SplatToInput(frameIdx);
+        int spread = ActiveSpread;
+        if (spread > 0) StepSpreadInference(spread);
+        else
+        {
+            DrainPending();   // no-op unless the spread was just switched off mid-inference
+            BeginInference();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            float[] pred = RunModel();
+            sw.Stop();
+            inferMs = Mathf.Lerp(inferMs <= 0f ? (float)sw.Elapsed.TotalMilliseconds : inferMs,
+                                 (float)sw.Elapsed.TotalMilliseconds, 0.1f);
+            ProcessPrediction(pred);
+        }
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        float[] pred = RunModel();
-        sw.Stop();
+        CaptureAndStatus();
+    }
+
+    // Everything downstream of the network for one prediction: kThick, the (depth, thickness,
+    // alpha) stage, smoothing, temporal, the 512² shading packs and the composite parameters.
+    void ProcessPrediction(float[] pred)
+    {
         lastPred = pred;
         OnInferred?.Invoke();
-        inferMs = Mathf.Lerp(inferMs <= 0f ? (float)sw.Elapsed.TotalMilliseconds : inferMs,
-                             (float)sw.Elapsed.TotalMilliseconds, 0.1f);
+        float now = Time.realtimeSinceStartup;
+        if (lastPredTime >= 0f && now > lastPredTime)
+            fluidHz = fluidHz <= 0f ? 1f / (now - lastPredTime) : Mathf.Lerp(fluidHz, 1f / (now - lastPredTime), 0.2f);
+        lastPredTime = now;
 
         // kThick: as in FluidLiveMVP — derive from predicted thickness, lock mid-sequence.
         if (kThickOverride > 0f) kThick = kThickOverride;
@@ -658,6 +857,7 @@ public class FluidSceneMVP : MonoBehaviour
                     }
                 }
                 px[flipped] = new Color(depth, thick, a, spd);
+                foamFluidDepth[i] = a > 0f ? depth : 0f;
                 if (a > 0f) { dSum += depth; dSumSq += (double)depth * depth; fgCount++; }
             }
         bilateralSigmaR = 0.05f;
@@ -721,11 +921,89 @@ public class FluidSceneMVP : MonoBehaviour
         compositeMat.SetFloat("_WinAspect", winAspect);
         compositeMat.SetFloat("_SimScale", transform.lossyScale.x);
         compositeMat.SetFloat("_DepthBias", depthBias);
-        Transform c = targetCamera.transform;
-        compositeMat.SetVector("_CamRightWS", c.right);
-        compositeMat.SetVector("_CamUpWS", c.up);
-        compositeMat.SetVector("_CamFwdWS", c.forward);
+        // the SPLAT camera's basis, not the current one: between spread predictions this keeps
+        // the fluid world-locked through camera rotation (identical to the current camera when synchronous)
+        compositeMat.SetVector("_CamRightWS", shadeRightWS);
+        compositeMat.SetVector("_CamUpWS", shadeUpWS);
+        compositeMat.SetVector("_CamFwdWS", shadeFwdWS);
+        DrawFoam();
+        quadMR.enabled = true;
+    }
 
+    // ---------- 059 whitewater layer ----------
+
+    // Sim time the foam advances on: the GPU solver's own clock when live (so the layer steps once per NEW
+    // solver frame, whatever the render rate), else the playback clock.
+    float FoamClock => provider is GpuSphProvider gpu ? gpu.SolverTime : simTime;
+
+    float FoamRadius => foamRadiusOverride > 0f ? foamRadiusOverride
+        : provider.ParticleRadius > 0f ? provider.ParticleRadius
+        : meta.coarseRadius > 0f ? meta.coarseRadius : 0.0414f;
+
+    void ApplyFoamKnobs()
+    {
+        foam.spawnScale = foamSpawnScale; foam.kTa = foamKTa; foam.kWc = foamKWc; foam.tauScale = foamTauScale;
+        foam.tauDecay = foamTauDecay; foam.tauPercentile = foamTauPercentile; foam.tauMinFrac = foamTauMinFrac;
+        foam.kineticMinSpeed = foamKineticSpeed.x; foam.kineticMaxSpeed = Mathf.Max(foamKineticSpeed.y, foamKineticSpeed.x + 1e-3f);
+        foam.crestMinVelDotN = foamCrestMinVelDotN; foam.surfaceFrac = foamSurfaceFrac; foam.nFullPercentile = foamNFullPercentile;
+        foam.maxDiffuse = Mathf.Max(foamMaxDiffuse, 1000);
+        foam.lifeMin = foamLifetime.x; foam.lifeMax = Mathf.Max(foamLifetime.y, foamLifetime.x);
+        foam.sprayFrac = foamSprayFrac; foam.bubbleFrac = foamBubbleFrac; foam.buoyancy = foamBuoyancy; foam.drag = foamDrag;
+        foam.gravity = foamGravity; foam.sprayMaxAge = foamSprayMaxAge; foam.orphanMaxAge = foamOrphanMaxAge;
+        foam.floorY = foamFloorY; foam.domainMin = foamDomainMin; foam.domainMax = foamDomainMax;
+        foam.spriteScale = foamSpriteScale; foam.spraySprite = foamSpriteFrac.x; foam.foamSprite = foamSpriteFrac.y;
+        foam.maxSpritePx = foamMaxSpritePx;
+        foam.weightSpray = foamTypeWeights.x; foam.weightFoam = foamTypeWeights.y; foam.weightBubble = foamTypeWeights.z;
+        foam.hiddenWeight = foamHiddenWeight; foam.depthTolR = foamDepthTolR; foam.blur = foamBlur;
+    }
+
+    // Advance the diffuse particles in the frame just splatted (GetFrame re-serves the cached readback).
+    void StepFoam()
+    {
+        float clock = FoamClock;
+        float fdt = Mathf.Clamp(clock - lastFoamClock, 0f, 0.2f);
+        lastFoamClock = clock;
+        if (!foamEnabled || fdt <= 0f) return;   // paused / no new solver frame: particles hold still
+        ApplyFoamKnobs();
+        provider.GetFrame(frameIdx, out var data, out int off, out int count);
+        foam.Step(data, off, count, FoamRadius, fdt);
+    }
+
+    // Draw the particles from the SPLAT camera (the pose this prediction came from, so the layer stays
+    // world-locked with the fluid in spread mode) into the model window, depth-tested against its depth.
+    void DrawFoam()
+    {
+        compositeMat.SetFloat("_FoamOn", foamEnabled ? 1f : 0f);
+        compositeMat.SetFloat("_FoamOnly", foamEnabled && foamOnlyView ? 1f : 0f);
+        if (!foamEnabled) return;
+        ApplyFoamKnobs();
+        foam.Splat(eyeSim, rightSim, upSim, fwdSim, focalM, H, W, foamFluidDepth, FoamRadius, foamDen, foamTmp, foamFront, winAspect);
+        UploadFoam(foamTex, foamDen);
+        UploadFoam(foamDepthTex, foamFront);
+
+        Color c = foamColor.linear * foamBrightness;
+        if (mainLight != null && foamLightInfluence > 0f)
+        {
+            Color l = mainLight.color.linear * mainLight.intensity;
+            c *= Color.Lerp(Color.white, l, foamLightInfluence);
+        }
+        compositeMat.SetTexture("_FoamTex", foamTex);
+        compositeMat.SetTexture("_FoamDepthTex", foamDepthTex);
+        compositeMat.SetFloat("_FoamK", foamCoverageK);
+        compositeMat.SetFloat("_FoamOpacity", foamOpacity);
+        compositeMat.SetVector("_FoamColor", new Vector4(c.r, c.g, c.b, 0f));   // linear, no gamma conversion
+    }
+
+    void UploadFoam(Texture2D tex, float[] chw)
+    {
+        for (int y = 0; y < H; y++)
+            Array.Copy(chw, y * W, foamStage, (H - 1 - y) * W, W);   // tensor row 0 = top; texture row 0 = bottom
+        tex.SetPixelData(foamStage, 0);
+        tex.Apply(false, false);
+    }
+
+    void CaptureAndStatus()
+    {
         // warm up (no screenshots) until kThick locks, so capture brightness is constant
         if (capturing && (kThickLocked || kThickOverride > 0f))
         {
@@ -745,20 +1023,24 @@ public class FluidSceneMVP : MonoBehaviour
             : provider is GpuSphProvider gpu
                 ? $"LIVE GPU-PBF {gpu.ActiveParticles}p solver {gpu.LastStepMs:F1}ms   " : "";
         status = live + $"frame {frameIdx + 1}/{provider.FrameCount}   sim {playbackFps:F0} fps ×{speed:F1}   " +
-                 $"render {smoothedFps:F1} fps   infer {inferMs:F1} ms   backend={backend} fp16={fp16Active}   " +
+                 $"render {smoothedFps:F1} fps   " +
+                 (ActiveSpread > 0 ? $"infer spread/{ActiveSpread} {inferMs:F0} ms latency, fluid {fluidHz:F1} Hz   "
+                                   : $"infer {inferMs:F1} ms   ") +
+                 $"backend={backend} fp16={fp16Active}   " +
                  $"k_thick={kThick:F3}{(showRawInput ? "   RAW INPUT" : "")}" +
                  $"{(bilateralSmoothing ? "   BILATERAL" : "")}{(paused ? "   PAUSED" : "")}" +
-                 $"{(capturing ? "   CAPTURING" : "")}";
+                 $"{(capturing ? "   CAPTURING" : "")}" +
+                 (foamEnabled ? $"   FOAM{(foamOnlyView ? " ONLY" : "")} {foam.Alive} ({foam.Spray}s/{foam.Foam}f/{foam.Bubble}b) " +
+                                $"+{foam.SpawnedTa}ta/{foam.SpawnedWc}wc  {foam.LastStepMs:F1}+{foam.LastSplatMs:F1} ms" : "");
     }
 
     void SetShadeParams(Material m)
     {
-        Transform c = targetCamera.transform;
         m.SetFloat("_FocalM", focalM);
         m.SetFloat("_WinAspect", winAspect);
-        m.SetVector("_CamRightWS", c.right);
-        m.SetVector("_CamUpWS", c.up);
-        m.SetVector("_CamFwdWS", c.forward);
+        m.SetVector("_CamRightWS", shadeRightWS);
+        m.SetVector("_CamUpWS", shadeUpWS);
+        m.SetVector("_CamFwdWS", shadeFwdWS);
         m.SetFloat("_KThick", kThick);
         m.SetFloat("_RefrStrength", refrStrength);
 
@@ -818,10 +1100,12 @@ public class FluidSceneMVP : MonoBehaviour
 
         if (kb != null)
         {
-            if (kb.pKey.wasPressedThisFrame) paused = !paused;
-            if (kb.bKey.wasPressedThisFrame) bilateralSmoothing = !bilateralSmoothing;
-            if (kb.vKey.wasPressedThisFrame) showRawInput = !showRawInput;
-            if (kb.rKey.wasPressedThisFrame) { simTime = 0f; provider?.ResetSim(); hasHistory = false; }
+            if (kb.pKey.wasPressedThisFrame) TogglePause();
+            if (kb.bKey.wasPressedThisFrame) ToggleBilateral();
+            if (kb.vKey.wasPressedThisFrame) ToggleRawInput();
+            if (kb.rKey.wasPressedThisFrame) ResetSim();
+            if (kb.gKey.wasPressedThisFrame) ToggleFoam();
+            if (kb.hKey.wasPressedThisFrame) ToggleFoamOnlyView();
             if (kb.leftBracketKey.wasPressedThisFrame) playbackFps = Mathf.Max(1f, playbackFps - 5f);
             if (kb.rightBracketKey.wasPressedThisFrame) playbackFps += 5f;
 
@@ -856,7 +1140,10 @@ public class FluidSceneMVP : MonoBehaviour
 
     void OnGUI()
     {
-        if (showStatus) GUI.Label(new Rect(10, 8, 1600, 24), status);
+        if (!showStatus) return;
+        float s = TouchControls.BeginScaledGUI();   // identity on desktop; dpi-scaled + safe-area on phones
+        GUI.Label(new Rect(10, 8, Mathf.Max(Screen.width / s - 20, 200), 60), status);
+        GUI.matrix = Matrix4x4.identity;
     }
 
     void OnDrawGizmosSelected()
@@ -880,8 +1167,11 @@ public class FluidSceneMVP : MonoBehaviour
 
     void OnDestroy()
     {
+        pendingInput?.Dispose();
         worker?.Dispose();
         if (fieldTex != null) Destroy(fieldTex);
+        if (foamTex != null) Destroy(foamTex);
+        if (foamDepthTex != null) Destroy(foamDepthTex);
         if (smoothedRT != null) smoothedRT.Release();
         if (smoothedRT2 != null) smoothedRT2.Release();
         if (cRT != null) cRT.Release();
