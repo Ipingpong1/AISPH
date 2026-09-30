@@ -35,6 +35,7 @@
 // B bilateral smoothing, [ / ] playback fps −/+5, G whitewater layer (FoamLayer), H whitewater only.
 // C surface source: network / classical C* (G3 classical, Overnight/Classical/FluidSceneMVP.Classical.cs; network by default).
 // J learned spray droplets (G2 learned spray, Overnight/Spray/FluidSceneMVP.Spray.cs; off by default).
+// M cycle the network: scene model -> Resources/SSU_ModelBank models (overnight model bank, Overnight/Models/FluidSceneMVP.ModelBank.cs).
 
 using System;
 using System.Collections;
@@ -785,6 +786,7 @@ public partial class FluidSceneMVP : MonoBehaviour
         provider.Tick(paused ? 0f : dt * speed);   // live solvers advance in lockstep
         frameIdx = (int)(simTime * playbackFps) % provider.FrameCount;
 
+        ApplyPendingModelSwitch();   // overnight model bank (key M; Overnight/Models)
         if (ClassicalActive) { ClassicalLateUpdate(); return; }   // G3 classical C* surface instead of splat + network (key C; Overnight/Classical)
 
         int spread = ActiveSpread;
@@ -1036,7 +1038,7 @@ public partial class FluidSceneMVP : MonoBehaviour
                  $"{(bilateralSmoothing ? "   BILATERAL" : "")}{(paused ? "   PAUSED" : "")}" +
                  $"{(capturing ? "   CAPTURING" : "")}" +
                  (foamEnabled ? $"   FOAM{(foamOnlyView ? " ONLY" : "")} {foam.Alive} ({foam.Spray}s/{foam.Foam}f/{foam.Bubble}b) " +
-                                $"+{foam.SpawnedTa}ta/{foam.SpawnedWc}wc  {foam.LastStepMs:F1}+{foam.LastSplatMs:F1} ms" : "") + SprayStatus();   // G2 learned spray
+                                $"+{foam.SpawnedTa}ta/{foam.SpawnedWc}wc  {foam.LastStepMs:F1}+{foam.LastSplatMs:F1} ms" : "") + SprayStatus() + ModelBankStatus();   // G2 learned spray; model bank (key M)
     }
 
     void SetShadeParams(Material m)
@@ -1113,6 +1115,7 @@ public partial class FluidSceneMVP : MonoBehaviour
             if (kb.hKey.wasPressedThisFrame) ToggleFoamOnlyView();
             if (kb.cKey.wasPressedThisFrame) ToggleSurfaceSource();   // G3 classical C* surface
             if (kb.jKey.wasPressedThisFrame) ToggleSpray();   // G2 learned spray
+            if (kb.mKey.wasPressedThisFrame) RequestModelCycle();   // overnight model bank (Overnight/Models)
             if (kb.leftBracketKey.wasPressedThisFrame) playbackFps = Mathf.Max(1f, playbackFps - 5f);
             if (kb.rightBracketKey.wasPressedThisFrame) playbackFps += 5f;
 
