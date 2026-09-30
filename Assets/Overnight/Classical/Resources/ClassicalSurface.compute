@@ -1,0 +1,462 @@
+// ClassicalSurface.compute — G3 overnight 2026-09-30: the classical C* surface (`t3_aniso+nr`, SSU_restart PBF suite)
+// on the GPU. A port of the Python oracle, op for op where it matters:
+//   Aniso      Helpers/aniso_render.py::anisotropic_kernels + _shape_kernels (Yu & Turk 2013 kernels with the Banana
+//              AniKernelGenerator defaults T&Y 2018 ship: h = 8 r, W = 1-(d/h)^3, lambda 0.5, < 25 neighbours -> 0.75 I,
+//              axis ratio 8, det 1; covariance weights re-evaluated from m_i over the SAME neighbour list, self in the
+//              denominator only). float32 here, float64 in Python.
+//   Project +  Helpers/aniso_render.py::render_aniso: ellipsoids {c + rho K u}, paraxial rays, pixel centres at +0.5,
+//   Raster     front root of the ray/quadric, nearest wins; kernels whose K columns agree within isoTol are drawn with
+//              splat_render_v2's SPHERE formula and its clamped footprint.
+//   NRPass1D/  Helpers/narrow_range_faithful.py (Truong & Yuksel 2018, shipped-code port): 1D H, V x iters on the
+//   NRPass2D   projected footprint, then the fixed 4-px 2D clean-up; background = far sentinel; bias correction and
+//              range extension on; gaussian spatial weights.
+// Every image buffer is in TENSOR layout (row 0 = TOP, index = row * W + col) like the oracle; only Pack writes the
+// texture layout (row 0 = bottom) that FluidSSFRScene reads.
+#pragma kernel Aniso
+#pragma kernel Project
+#pragma kernel ClearImage
+#pragma kernel Raster
+#pragma kernel Resolve
+#pragma kernel NRPass1D
+#pragma kernel NRPass2D
+#pragma kernel Pack
+
+#define KSTRIDE 24      // kernel record: c.xyz, K (row-major 9), K^-2 (row-major 9), n, flags(bit0 = iso draw), pad
+#define PSTRIDE 16      // projected record: pxf, pyf, dc, halfpx, rs(sphere draw radius), q00 q01 q02 q11 q12 q22, iso, on, pad x3
+#define BG_FAR 1.0e6
+
+// ------------------------------------------------------------------ shared
+int _N;
+StructuredBuffer<float> _Pos;            // 3 N (sim space)
+RWStructuredBuffer<float> _Kern;         // KSTRIDE N
+RWStructuredBuffer<float> _Proj;         // PSTRIDE N
+
+// ------------------------------------------------------------------ Aniso
+StructuredBuffer<uint> _CellStart;
+StructuredBuffer<uint> _CellCount;
+StructuredBuffer<uint> _CellIdx;
+StructuredBuffer<uint> _CellOf;          // [N] cell of each particle (CPU counting sort)
+float3 _GridOrigin;
+float _CellSize;
+int3 _GridDim;
+float _Hk;             // h = kernelRatio * r
+float _Lambda;
+float _AxisRatio;
+int _NbrThreshold;
+float _SpraySize;
+float _IsoTol;
+
+float3 LoadPos(int i) { return float3(_Pos[3 * i], _Pos[3 * i + 1], _Pos[3 * i + 2]); }
+
+float W3(float d2, float h)  // Yu & Turk isotropic weight 1 - (d/h)^3, 0 at and beyond h (aniso_render._w)
+{
+    float q = sqrt(max(d2, 0.0)) / h;
+    return (d2 < h * h) ? 1.0 - q * q * q : 0.0;
+}
+
+void JacobiRotate(inout float A[3][3], inout float V[3][3], int p, int q)
+{
+    float apq = A[p][q];
+    if (abs(apq) < 1e-37) return;
+    float theta = (A[q][q] - A[p][p]) / (2.0 * apq);
+    float t = (theta >= 0.0 ? 1.0 : -1.0) / (abs(theta) + sqrt(theta * theta + 1.0));
+    float c = 1.0 / sqrt(t * t + 1.0);
+    float s = t * c;
+    int k;
+    [unroll] for (k = 0; k < 3; k++) { float akp = A[k][p], akq = A[k][q]; A[k][p] = c * akp - s * akq; A[k][q] = s * akp + c * akq; }
+    [unroll] for (k = 0; k < 3; k++) { float apk = A[p][k], aqk = A[q][k]; A[p][k] = c * apk - s * aqk; A[q][k] = s * apk + c * aqk; }
+    [unroll] for (k = 0; k < 3; k++) { float vkp = V[k][p], vkq = V[k][q]; V[k][p] = c * vkp - s * vkq; V[k][q] = s * vkp + c * vkq; }
+}
+
+[numthreads(64, 1, 1)]
+void Aniso(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float3 xi = LoadPos(i);
+    float h = _Hk, h2 = _Hk * _Hk;
+    uint cl0 = _CellOf[i];                       // the CPU's own cell assignment (grid and search stay consistent)
+    int3 ci = int3((int)(cl0 % (uint)_GridDim.x), (int)((cl0 / (uint)_GridDim.x) % (uint)_GridDim.y),
+                   (int)(cl0 / (uint)(_GridDim.x * _GridDim.y)));
+
+    // pass 1: neighbours j != i with |x_j - x_i| < h; weighted mean with self weight 1 (relative to x_i)
+    float sw = 0.0;
+    float3 swd = float3(0, 0, 0);
+    int n = 0;
+    int dx, dy, dz;
+    uint t;
+    for (dz = -1; dz <= 1; dz++)
+    for (dy = -1; dy <= 1; dy++)
+    for (dx = -1; dx <= 1; dx++)
+    {
+        int3 c = ci + int3(dx, dy, dz);
+        if (any(c < 0) || any(c >= _GridDim)) continue;
+        uint cell = (uint)((c.z * _GridDim.y + c.y) * _GridDim.x + c.x);
+        uint s0 = _CellStart[cell], e0 = s0 + _CellCount[cell];
+        for (t = s0; t < e0; t++)
+        {
+            int j = (int)_CellIdx[t];
+            if (j == i) continue;
+            float3 d = LoadPos(j) - xi;
+            float d2 = dot(d, d);
+            if (d2 < h2)
+            {
+                float w = W3(d2, h);
+                sw += w;
+                swd += w * d;
+                n++;
+            }
+        }
+    }
+    float3 mrel = swd / (1.0 + sw);              // m_i - x_i
+    float3 centre = xi + _Lambda * mrel;         // lerp(x_i, m_i, lambda)
+
+    // pass 2: covariance about m_i over the SAME neighbour list, weights re-evaluated from m_i
+    float c00 = 0, c01 = 0, c02 = 0, c11 = 0, c12 = 0, c22 = 0, sw2 = 0;
+    for (dz = -1; dz <= 1; dz++)
+    for (dy = -1; dy <= 1; dy++)
+    for (dx = -1; dx <= 1; dx++)
+    {
+        int3 c = ci + int3(dx, dy, dz);
+        if (any(c < 0) || any(c >= _GridDim)) continue;
+        uint cell = (uint)((c.z * _GridDim.y + c.y) * _GridDim.x + c.x);
+        uint s0 = _CellStart[cell], e0 = s0 + _CellCount[cell];
+        for (t = s0; t < e0; t++)
+        {
+            int j = (int)_CellIdx[t];
+            if (j == i) continue;
+            float3 d = LoadPos(j) - xi;
+            if (!(dot(d, d) < h2)) continue;
+            float3 e = d - mrel;
+            float w2 = W3(dot(e, e), h);
+            sw2 += w2;
+            c00 += w2 * e.x * e.x; c01 += w2 * e.x * e.y; c02 += w2 * e.x * e.z;
+            c11 += w2 * e.y * e.y; c12 += w2 * e.y * e.z; c22 += w2 * e.z * e.z;
+        }
+    }
+    float inv = 1.0 / (1.0 + sw2);
+    float A[3][3];
+    A[0][0] = c00 * inv; A[0][1] = c01 * inv; A[0][2] = c02 * inv;
+    A[1][0] = A[0][1];   A[1][1] = c11 * inv; A[1][2] = c12 * inv;
+    A[2][0] = A[0][2];   A[2][1] = A[1][2];   A[2][2] = c22 * inv;
+    float V[3][3];
+    V[0][0] = 1; V[0][1] = 0; V[0][2] = 0;
+    V[1][0] = 0; V[1][1] = 1; V[1][2] = 0;
+    V[2][0] = 0; V[2][1] = 0; V[2][2] = 1;
+    float scaleSq = A[0][0] * A[0][0] + A[1][1] * A[1][1] + A[2][2] * A[2][2] + 1e-37;
+    [loop] for (int sweep = 0; sweep < 12; sweep++)
+    {
+        float off = A[0][1] * A[0][1] + A[0][2] * A[0][2] + A[1][2] * A[1][2];
+        if (off <= 1e-14 * scaleSq) break;
+        JacobiRotate(A, V, 0, 1);
+        JacobiRotate(A, V, 0, 2);
+        JacobiRotate(A, V, 1, 2);
+    }
+    // eigenvalues descending (S_0 largest), clamped at 0 (torch: evals.flip(-1).clamp(min=0))
+    float ev[3] = { A[0][0], A[1][1], A[2][2] };
+    int o0 = 0, o1 = 1, o2 = 2, tmp;
+    if (ev[o1] > ev[o0]) { tmp = o0; o0 = o1; o1 = tmp; }
+    if (ev[o2] > ev[o0]) { tmp = o0; o0 = o2; o2 = tmp; }
+    if (ev[o2] > ev[o1]) { tmp = o1; o1 = o2; o2 = tmp; }
+    float S0 = max(ev[o0], 0.0), S1 = max(ev[o1], 0.0), S2 = max(ev[o2], 0.0);
+    S1 = max(S1, S0 / _AxisRatio);
+    S2 = max(S2, S0 / _AxisRatio);
+    float prod = S0 * S1 * S2;
+    bool ok = prod > 0.0;
+    bool spray = (n < _NbrThreshold) || !ok;
+    float3 q0 = float3(V[0][o0], V[1][o0], V[2][o0]);
+    float3 q1 = float3(V[0][o1], V[1][o1], V[2][o1]);
+    float3 q2 = float3(V[0][o2], V[1][o2], V[2][o2]);
+    float K[9], Ki[9];
+    if (spray)
+    {
+        float ss = _SpraySize, si = 1.0 / (_SpraySize * _SpraySize);
+        K[0] = ss; K[1] = 0; K[2] = 0; K[3] = 0; K[4] = ss; K[5] = 0; K[6] = 0; K[7] = 0; K[8] = ss;
+        Ki[0] = si; Ki[1] = 0; Ki[2] = 0; Ki[3] = 0; Ki[4] = si; Ki[5] = 0; Ki[6] = 0; Ki[7] = 0; Ki[8] = si;
+    }
+    else
+    {
+        float g = exp2(log2(prod) * (-1.0 / 3.0));     // cbrt(1 / prod): det K = 1
+        float ka = S0 * g, kb = S1 * g, kc = S2 * g;
+        float ia = 1.0 / (ka * ka), ib = 1.0 / (kb * kb), ic = 1.0 / (kc * kc);
+        [unroll] for (int r = 0; r < 3; r++)
+        [unroll] for (int cl = 0; cl < 3; cl++)
+        {
+            float p0 = q0[r] * q0[cl], p1 = q1[r] * q1[cl], p2 = q2[r] * q2[cl];
+            K[3 * r + cl] = ka * p0 + kb * p1 + kc * p2;     // Q S Q^T
+            Ki[3 * r + cl] = ia * p0 + ib * p1 + ic * p2;    // Q S^-2 Q^T = K^-2
+        }
+    }
+    // depth-pass.vs.glsl UNIT_SPHERE_ISOLATED_PARTICLE: the three COLUMN lengths agree within isoTol
+    float l0 = sqrt(K[0] * K[0] + K[3] * K[3] + K[6] * K[6]);
+    float l1 = sqrt(K[1] * K[1] + K[4] * K[4] + K[7] * K[7]);
+    float l2 = sqrt(K[2] * K[2] + K[5] * K[5] + K[8] * K[8]);
+    bool iso = abs(l0 - l1) < _IsoTol && abs(l1 - l2) < _IsoTol && abs(l2 - l0) < _IsoTol;
+
+    int b = i * KSTRIDE;
+    _Kern[b + 0] = centre.x; _Kern[b + 1] = centre.y; _Kern[b + 2] = centre.z;
+    [unroll] for (int k = 0; k < 9; k++) { _Kern[b + 3 + k] = K[k]; _Kern[b + 12 + k] = Ki[k]; }
+    _Kern[b + 21] = (float)n;
+    _Kern[b + 22] = iso ? 1.0 : 0.0;
+    _Kern[b + 23] = spray ? 1.0 : 0.0;
+}
+
+// ------------------------------------------------------------------ Project (per particle)
+float3 _Eye, _Right, _Up, _Fwd;
+float _Focal;
+float _Ppu;            // focal * H / 2   (computed in double on the CPU, like Python's float)
+float _Aspect;         // W / H
+int _Hpx, _Wpx;
+float _Rho;            // sprite radius k * r
+float _Rho2;           // rho^2 (double on the CPU -> float, like Python's float(radius) ** 2)
+float _RhoPpu;         // rho * ppu (double on the CPU -> float, like Python's radius * ppu)
+float _MinRpx, _MaxRpx, _SphMaxRpx;
+
+[numthreads(64, 1, 1)]
+void Project(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    int b = i * KSTRIDE, o = i * PSTRIDE;
+    float3 c = float3(_Kern[b], _Kern[b + 1], _Kern[b + 2]);
+    float3 rel = c - _Eye;
+    float camx = dot(rel, _Right), camy = dot(rel, _Up);
+    float dc = dot(rel, _Fwd);                                   // = -cam.z
+    _Proj[o + 13] = 0.0;
+    if (!(dc > 1e-3)) return;
+    float pxf = (_Focal * camx / dc / _Aspect + 1.0) * 0.5 * _Wpx;
+    float pyf = (1.0 - _Focal * camy / dc) * 0.5 * _Hpx;
+    bool iso = _Kern[b + 22] > 0.5;
+    // camera-space K: M = R K R^T with R rows (right, up, -fwd); Sigma = rho^2 R K^2 R^T, Q = Sigma^-1 = R K^-2 R^T / rho^2
+    float3 R0 = _Right, R1 = _Up, R2 = -_Fwd;
+    float3 k0 = float3(_Kern[b + 3], _Kern[b + 4], _Kern[b + 5]);
+    float3 k1 = float3(_Kern[b + 6], _Kern[b + 7], _Kern[b + 8]);
+    float3 k2 = float3(_Kern[b + 9], _Kern[b + 10], _Kern[b + 11]);
+    // A = rho * (R K): row a of A = rho * (R_a K) ;  Sigma_aa = |A_a|^2
+    float3 A0 = _Rho * float3(dot(R0, float3(k0.x, k1.x, k2.x)), dot(R0, float3(k0.y, k1.y, k2.y)), dot(R0, float3(k0.z, k1.z, k2.z)));
+    float3 A1 = _Rho * float3(dot(R1, float3(k0.x, k1.x, k2.x)), dot(R1, float3(k0.y, k1.y, k2.y)), dot(R1, float3(k0.z, k1.z, k2.z)));
+    float sxx = dot(A0, A0), syy = dot(A1, A1);
+    float3 i0 = float3(_Kern[b + 12], _Kern[b + 13], _Kern[b + 14]);
+    float3 i1 = float3(_Kern[b + 15], _Kern[b + 16], _Kern[b + 17]);
+    float3 i2 = float3(_Kern[b + 18], _Kern[b + 19], _Kern[b + 20]);
+    // T = K^-2 R^T : column a of T = K^-2 R_a ;  Q_ab = R_a . (K^-2 R_b) / rho^2
+    float3 t0 = float3(dot(i0, R0), dot(i1, R0), dot(i2, R0));
+    float3 t1 = float3(dot(i0, R1), dot(i1, R1), dot(i2, R1));
+    float3 t2 = float3(dot(i0, R2), dot(i1, R2), dot(i2, R2));
+    float ir2 = 1.0 / _Rho2;
+    float q00 = dot(R0, t0) * ir2, q01 = dot(R0, t1) * ir2, q02 = dot(R0, t2) * ir2;
+    float q11 = dot(R1, t1) * ir2, q12 = dot(R1, t2) * ir2, q22 = dot(R2, t2) * ir2;
+
+    float rSph = _RhoPpu / dc;
+    float rsDraw = clamp(rSph, _MinRpx, _SphMaxRpx);
+    float halfpx = sqrt(max(max(sxx, syy), 0.0)) * _Ppu / dc;
+    halfpx = iso ? rsDraw : clamp(halfpx, _MinRpx, _MaxRpx);
+    bool on = (pxf + halfpx > 0.0) && (pxf - halfpx < (float)_Wpx) && (pyf + halfpx > 0.0) && (pyf - halfpx < (float)_Hpx);
+    _Proj[o + 0] = pxf; _Proj[o + 1] = pyf; _Proj[o + 2] = dc; _Proj[o + 3] = halfpx; _Proj[o + 4] = rsDraw;
+    _Proj[o + 5] = q00; _Proj[o + 6] = q01; _Proj[o + 7] = q02; _Proj[o + 8] = q11; _Proj[o + 9] = q12; _Proj[o + 10] = q22;
+    _Proj[o + 11] = iso ? 1.0 : 0.0;
+    _Proj[o + 13] = on ? 1.0 : 0.0;
+}
+
+// ------------------------------------------------------------------ image buffers
+RWStructuredBuffer<uint> _DepthKey;      // H W, order-preserving float keys, 0xFFFFFFFF = empty
+RWStructuredBuffer<uint> _ThickFix;      // H W, thickness in 1e-6 units
+RWStructuredBuffer<float> _SplatDepth;   // H W
+RWStructuredBuffer<float> _Mask;         // H W (0/1)
+RWStructuredBuffer<float> _Thick;        // H W
+float _ThickPerM;                        // thickness units per metre of chord (thicknessScale / k^3: volume-matched)
+
+uint FloatToKey(float f) { uint u = asuint(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
+float KeyToFloat(uint k) { return asfloat((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k); }
+
+[numthreads(8, 8, 1)]
+void ClearImage(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _Wpx || (int)id.y >= _Hpx) return;
+    uint p = id.y * (uint)_Wpx + id.x;
+    _DepthKey[p] = 0xFFFFFFFFu;
+    _ThickFix[p] = 0u;
+}
+
+// one 64-thread group per particle; the threads stride over its (2S+1)^2 stamp
+int _GroupsX;
+[numthreads(64, 1, 1)]
+void Raster(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    int i = (int)(gid.y * (uint)_GroupsX + gid.x);
+    if (i >= _N) return;
+    int o = i * PSTRIDE;
+    if (_Proj[o + 13] < 0.5) return;
+    float pxf = _Proj[o + 0], pyf = _Proj[o + 1], dc = _Proj[o + 2], halfpx = _Proj[o + 3], rs = _Proj[o + 4];
+    float q00 = _Proj[o + 5], q01 = _Proj[o + 6], q02 = _Proj[o + 7], q11 = _Proj[o + 8], q12 = _Proj[o + 9], q22 = _Proj[o + 10];
+    bool iso = _Proj[o + 11] > 0.5;
+    int S = (int)ceil(halfpx);
+    int side = 2 * S + 1;
+    int total = side * side;
+    int x0 = (int)floor(pxf), y0 = (int)floor(pyf);
+    float sc = dc / _Ppu;                 // world metres per px at the particle depth
+    float sc2 = sc * sc;
+    float rs2 = rs * rs, min2 = _MinRpx * _MinRpx;
+    for (int p = (int)gtid.x; p < total; p += 64)
+    {
+        uint row = (uint)p / (uint)side;
+        int ky = (int)row - S, kx = (int)((uint)p - row * (uint)side) - S;
+        int tx = x0 + kx, ty = y0 + ky;
+        if (tx < 0 || tx >= _Wpx || ty < 0 || ty >= _Hpx) continue;
+        float dx = ((float)tx + 0.5) - pxf;
+        float dy = ((float)ty + 0.5) - pyf;
+        float rho2 = dx * dx + dy * dy;
+        bool inside;
+        float d, chord;
+        if (iso)
+        {   // splat_render_v2's sphere, bit for bit: s2 = rho2 (dc/ppu)^2, d = dc - sqrt(max(r^2 - s2, 0))
+            inside = rho2 < rs2;
+            float s2 = rho2 * sc2;
+            float hh = sqrt(max(_Rho2 - s2, 0.0));
+            d = dc - hh;
+            chord = 2.0 * hh;
+        }
+        else
+        {
+            float sx = dx * sc, sy = -dy * sc;
+            float qa = q22;
+            float qb = q02 * sx + q12 * sy;
+            float qc = q00 * (sx * sx) + 2.0 * q01 * sx * sy + q11 * (sy * sy) - 1.0;
+            float disc = qb * qb - qa * qc;
+            float sq = sqrt(max(disc, 0.0));
+            float zeta = (-qb + sq) / qa;         // front (largest camera z) root
+            d = dc - zeta;
+            inside = (disc > 0.0) || (rho2 < min2);
+            chord = 2.0 * sq / qa;
+        }
+        if (!inside) continue;
+        uint pix = (uint)(ty * _Wpx + tx);
+        InterlockedMin(_DepthKey[pix], FloatToKey(d));
+        uint tq = (uint)(chord * _ThickPerM * 1.0e6 + 0.5);
+        if (tq > 0u) InterlockedAdd(_ThickFix[pix], tq);
+    }
+}
+
+RWStructuredBuffer<float> _DOut;         // NR ping-pong target (Resolve writes the splat depth into it too)
+
+[numthreads(8, 8, 1)]
+void Resolve(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _Wpx || (int)id.y >= _Hpx) return;
+    uint p = id.y * (uint)_Wpx + id.x;
+    uint k = _DepthKey[p];
+    bool hit = k != 0xFFFFFFFFu;
+    float d = hit ? KeyToFloat(k) : 0.0;
+    _SplatDepth[p] = d;
+    _DOut[p] = d;
+    _Mask[p] = hit ? 1.0 : 0.0;
+    _Thick[p] = (float)_ThickFix[p] * 1.0e-6;
+}
+
+// ------------------------------------------------------------------ narrow-range filter (T&Y 2018, shipped code)
+StructuredBuffer<float> _DIn;
+StructuredBuffer<float> _MaskIn;
+float _NRK;            // filter_size * f_px * r * 0.1 (double on the CPU -> float)
+int _NRMaxR;           // max_filter_size (100)
+float _Delta;          // threshold_ratio * r
+float _Mu;             // clamp_ratio * r
+int _Axis;             // 1 = horizontal (dx = k), 0 = vertical (dy = k)   [narrow_range_faithful._pass_1d]
+int _CleanR;           // clean-up radius (4)
+
+float SrcAt(int x, int y)
+{   // replicate padding + background = far sentinel (narrow_range_faithful._neighbour_source / _padded_shifter)
+    x = clamp(x, 0, _Wpx - 1);
+    y = clamp(y, 0, _Hpx - 1);
+    uint p = (uint)(y * _Wpx + x);
+    return _MaskIn[p] > 0.5 ? _DIn[p] : BG_FAR;
+}
+
+// narrow_range_faithful._rule with a partner weight (bias correction) and range extension
+void Rule(inout float zn, inout float w, inout float wPartner, inout float nearV, inout float farV, float clampV)
+{
+    bool nearer = zn < nearV;
+    if (nearer) { w = 0.0; wPartner = 0.0; zn = clampV; return; }
+    if (zn > farV) { zn = clampV; return; }
+    nearV = min(nearV, zn - _Delta);
+    farV = max(farV, zn + _Delta);
+}
+
+[numthreads(8, 8, 1)]
+void NRPass1D(uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x, y = (int)id.y;
+    if (x >= _Wpx || y >= _Hpx) return;
+    uint p = (uint)(y * _Wpx + x);
+    float D = _DIn[p];
+    if (!(_MaskIn[p] > 0.5)) { _DOut[p] = D; return; }
+    // projected_filter_radius_px on the CURRENT depth: min(max_filter_size, ceil(K / max(D, 1e-6))), 0 where D <= 0
+    int rad = D > 0.0 ? (int)min(ceil(_NRK / max(D, 1e-6)), (float)_NRMaxR) : 0;
+    float sigma = max((float)rad / 3.0, 1e-3);
+    float twoS2 = 2.0 * (sigma * sigma);
+    float nearP = D - _Delta, farP = D + _Delta, nearM = nearP, farM = farP;
+    float clampV = D + _Mu;
+    float s = D, ws = 1.0;
+    int sx = _Axis == 1 ? 1 : 0, sy = _Axis == 1 ? 0 : 1;
+    for (int k = 1; k <= rad; k++)
+    {
+        float w = exp(-(float)(k * k) / twoS2);
+        float zp = SrcAt(x + sx * k, y + sy * k);
+        float zm = SrcAt(x - sx * k, y - sy * k);
+        float wp = w, wm = w;
+        Rule(zp, wp, wm, nearP, farP, clampV);
+        Rule(zm, wm, wp, nearM, farM, clampV);
+        s = s + zp * wp;                 // Python: s + zp * wp + zm * wm (left to right)
+        s = s + zm * wm;
+        ws = ws + wp;
+        ws = ws + wm;
+    }
+    _DOut[p] = s / ws;
+}
+
+[numthreads(8, 8, 1)]
+void NRPass2D(uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x, y = (int)id.y;
+    if (x >= _Wpx || y >= _Hpx) return;
+    uint p = (uint)(y * _Wpx + x);
+    float D = _DIn[p];
+    if (!(_MaskIn[p] > 0.5)) { _DOut[p] = D; return; }
+    int rad = _CleanR;
+    float sigma = max((float)rad / 3.0, 1e-3);
+    float twoS2 = 2.0 * (sigma * sigma);
+    float nearV = D - _Delta, farV = D + _Delta, clampV = D + _Mu;
+    float s = D, ws = 1.0;
+    for (int ax = 1; ax <= rad; ax++)
+    for (int ay = 1; ay <= rad; ay++)
+    {
+        float w0 = exp(-(float)(ax * ax + ay * ay) / twoS2);
+        // samples (+x,+y), (+x,-y), (-x,+y), (-x,-y) with image y DOWN (tensor rows); partners 0<->3, 1<->2
+        float z0 = SrcAt(x + ax, y + ay), z1 = SrcAt(x + ax, y - ay), z2 = SrcAt(x - ax, y + ay), z3 = SrcAt(x - ax, y - ay);
+        float w_0 = w0, w_1 = w0, w_2 = w0, w_3 = w0;
+        Rule(z0, w_0, w_3, nearV, farV, clampV);
+        Rule(z1, w_1, w_2, nearV, farV, clampV);
+        Rule(z2, w_2, w_1, nearV, farV, clampV);
+        Rule(z3, w_3, w_0, nearV, farV, clampV);
+        s = s + z0 * w_0; s = s + z1 * w_1; s = s + z2 * w_2; s = s + z3 * w_3;
+        ws = ws + w_0; ws = ws + w_1; ws = ws + w_2; ws = ws + w_3;
+    }
+    _DOut[p] = s / ws;
+}
+
+// ------------------------------------------------------------------ Pack (texture layout for the shading)
+RWTexture2D<float4> _OutTex;             // (depth, thickness, alpha, 0), row 0 = BOTTOM
+RWStructuredBuffer<float> _ShadeDepth;   // the same depth in TENSOR layout, 0 = no fluid (foam's depth test)
+float _DepthOffset;
+
+[numthreads(8, 8, 1)]
+void Pack(uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x, y = (int)id.y;
+    if (x >= _Wpx || y >= _Hpx) return;
+    uint p = (uint)(y * _Wpx + x);
+    bool fg = _MaskIn[p] > 0.5;
+    float d = fg ? _DIn[p] - _DepthOffset : 0.0;
+    float t = fg ? _Thick[p] : 0.0;
+    _OutTex[uint2(x, _Hpx - 1 - y)] = float4(d, t, fg ? 1.0 : 0.0, 0.0);
+    _ShadeDepth[p] = d;
+}

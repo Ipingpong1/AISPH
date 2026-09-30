@@ -33,6 +33,7 @@
 // Controls (when flyControls is on): WASD fly (+Q/E world down/up, Shift ×3), hold RMB +
 // mouse to look, P pause, R restart, V shade raw model input instead of the prediction,
 // B bilateral smoothing, [ / ] playback fps −/+5, G whitewater layer (FoamLayer), H whitewater only.
+// C surface source: network / classical C* (G3 classical, Overnight/Classical/FluidSceneMVP.Classical.cs; network by default).
 // J learned spray droplets (G2 learned spray, Overnight/Spray/FluidSceneMVP.Spray.cs; off by default).
 
 using System;
@@ -784,6 +785,8 @@ public partial class FluidSceneMVP : MonoBehaviour
         provider.Tick(paused ? 0f : dt * speed);   // live solvers advance in lockstep
         frameIdx = (int)(simTime * playbackFps) % provider.FrameCount;
 
+        if (ClassicalActive) { ClassicalLateUpdate(); return; }   // G3 classical C* surface instead of splat + network (key C; Overnight/Classical)
+
         int spread = ActiveSpread;
         if (spread > 0) StepSpreadInference(spread);
         else
@@ -1108,6 +1111,7 @@ public partial class FluidSceneMVP : MonoBehaviour
             if (kb.rKey.wasPressedThisFrame) ResetSim();
             if (kb.gKey.wasPressedThisFrame) ToggleFoam();
             if (kb.hKey.wasPressedThisFrame) ToggleFoamOnlyView();
+            if (kb.cKey.wasPressedThisFrame) ToggleSurfaceSource();   // G3 classical C* surface
             if (kb.jKey.wasPressedThisFrame) ToggleSpray();   // G2 learned spray
             if (kb.leftBracketKey.wasPressedThisFrame) playbackFps = Mathf.Max(1f, playbackFps - 5f);
             if (kb.rightBracketKey.wasPressedThisFrame) playbackFps += 5f;
@@ -1170,6 +1174,7 @@ public partial class FluidSceneMVP : MonoBehaviour
 
     void OnDestroy()
     {
+        DisposeClassical();   // G3 classical C* surface
         SprayShutdown();   // G2 learned spray
         pendingInput?.Dispose();
         worker?.Dispose();
