@@ -260,11 +260,14 @@ void Project(uint3 id : SV_DispatchThreadID)
 
 // ------------------------------------------------------------------ image buffers
 RWStructuredBuffer<uint> _DepthKey;      // H W, order-preserving float keys, 0xFFFFFFFF = empty
-RWStructuredBuffer<uint> _ThickFix;      // H W, thickness in 1e-6 units
+RWStructuredBuffer<uint> _ThickFix;      // H W, summed chord thickness in 1e-6 units (thickness mode 1)
+RWStructuredBuffer<uint> _BackKey;       // H W, order-preserving key of the FARTHEST back surface (thickness mode 0)
 RWStructuredBuffer<float> _SplatDepth;   // H W
 RWStructuredBuffer<float> _Mask;         // H W (0/1)
 RWStructuredBuffer<float> _Thick;        // H W
-float _ThickPerM;                        // thickness units per metre of chord (thicknessScale / k^3: volume-matched)
+float _ThickPerM;                        // mode 1: thickness units per metre of chord (thicknessScale / k^3: volume-matched)
+int _ThickMode;                          // 0 = (farthest back - nearest front) x _ThickGT ; 1 = volume-matched chord sum
+float _ThickGT;                          // mode 0: GT thickness unit per metre of path (pysurf bake scale)
 
 uint FloatToKey(float f) { uint u = asuint(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
 float KeyToFloat(uint k) { return asfloat((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k); }
@@ -276,6 +279,7 @@ void ClearImage(uint3 id : SV_DispatchThreadID)
     uint p = id.y * (uint)_Wpx + id.x;
     _DepthKey[p] = 0xFFFFFFFFu;
     _ThickFix[p] = 0u;
+    _BackKey[p] = 0u;
 }
 
 // one 64-thread group per particle; the threads stride over its (2S+1)^2 stamp
@@ -307,13 +311,14 @@ void Raster(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         float dy = ((float)ty + 0.5) - pyf;
         float rho2 = dx * dx + dy * dy;
         bool inside;
-        float d, chord;
+        float d, chord, dBack;
         if (iso)
         {   // splat_render_v2's sphere, bit for bit: s2 = rho2 (dc/ppu)^2, d = dc - sqrt(max(r^2 - s2, 0))
             inside = rho2 < rs2;
             float s2 = rho2 * sc2;
             float hh = sqrt(max(_Rho2 - s2, 0.0));
             d = dc - hh;
+            dBack = dc + hh;
             chord = 2.0 * hh;
         }
         else
@@ -326,14 +331,19 @@ void Raster(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
             float sq = sqrt(max(disc, 0.0));
             float zeta = (-qb + sq) / qa;         // front (largest camera z) root
             d = dc - zeta;
+            dBack = dc + (qb + sq) / qa;          // back root
             inside = (disc > 0.0) || (rho2 < min2);
             chord = 2.0 * sq / qa;
         }
         if (!inside) continue;
         uint pix = (uint)(ty * _Wpx + tx);
         InterlockedMin(_DepthKey[pix], FloatToKey(d));
-        uint tq = (uint)(chord * _ThickPerM * 1.0e6 + 0.5);
-        if (tq > 0u) InterlockedAdd(_ThickFix[pix], tq);
+        if (_ThickMode == 0) InterlockedMax(_BackKey[pix], FloatToKey(dBack));
+        else
+        {
+            uint tq = (uint)(chord * _ThickPerM * 1.0e6 + 0.5);
+            if (tq > 0u) InterlockedAdd(_ThickFix[pix], tq);
+        }
     }
 }
 
@@ -350,7 +360,9 @@ void Resolve(uint3 id : SV_DispatchThreadID)
     _SplatDepth[p] = d;
     _DOut[p] = d;
     _Mask[p] = hit ? 1.0 : 0.0;
-    _Thick[p] = (float)_ThickFix[p] * 1.0e-6;
+    float t = (float)_ThickFix[p] * 1.0e-6;
+    if (_ThickMode == 0) t = hit ? max(KeyToFloat(_BackKey[p]) - d, 0.0) * _ThickGT : 0.0;
+    _Thick[p] = t;
 }
 
 // ------------------------------------------------------------------ narrow-range filter (T&Y 2018, shipped code)

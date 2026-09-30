@@ -15,8 +15,8 @@
 //   With classicalApplyPostFilters on, presmooth / bilateral are applied like the network path; temporal stays off.
 // kThick (Beer-Lambert scale): kThickOverride if set (SampleScene: 0.5); else the network's locked value (one shared
 //   material); else derived from the classical thickness with the network path's own rule (1.2 / median, same lock).
-//   Classical thickness = ellipsoid chord sum x thicknessScale / k^3, i.e. volume-matched to the v2 unit the network's
-//   thickness shares (engineering choice for shading; the research row scores depth + mask only).
+//   Classical thickness (shading only; the research row scores depth + mask) = path length through the ellipsoids x
+//   15.851, the pysurf GT scale 067a / 060a were trained on, i.e. the network's own thickness unit (see ClassicalSurface).
 // Foam (G / FoamLayer): works in both modes; in classical mode its fluid depth is a synchronous readback.
 // Learned spray (G2, key J): if present and on, the classical field is read back into the CPU field so the spray
 //   layer composites its droplets exactly as it does for the network (found by reflection: no compile-time coupling).
@@ -73,9 +73,11 @@ public partial class FluidSceneMVP
             return;
         }
         CaptureAndStatus();
+        // the network is not run in classical mode: drop its (stale) inference timing from the status line
+        status = System.Text.RegularExpressions.Regex.Replace(status, @"infer (spread/\d+ )?[0-9.]+ ms( latency, fluid [0-9.]+ Hz)?", "network idle");
         var cs = classicalSettings;
         status += $"   CLASSICAL C* (k {cs.radiusMult:0.##}, NR {(cs.narrowRange ? $"{cs.nrFilterSize}/{cs.nrIters}/{cs.nrThresholdRatio:0.#}" : "off")}" +
-                  $"{(classicalApplyPostFilters ? ", +post" : "")}) {classical.Count}p cpu {classicalMs:F1} ms";
+                  $"{(classicalApplyPostFilters ? ", +post" : "")}) {classical.Count}p cpu {classicalMs:F2} ms";
     }
 
     void ClassicalFrame()

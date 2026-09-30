@@ -8,8 +8,9 @@
 //      < 25 neighbours -> 0.75 I (drawn as a sphere).
 //   2. Ellipsoid depth splat at sprite radius k r (k = 3): exact paraxial ray / quadric front root per pixel,
 //      nearest wins (InterlockedMin on order-preserving keys); iso kernels use splat_render_v2's sphere formula.
-//      Thickness (shading only, not part of the research row): sum of chord lengths through the same ellipsoids
-//      x thicknessScale / k^3 (volume-matched to the v2 input's unit, which the network's thickness shares).
+//      Thickness (shading only, not part of the research row): path length through the ellipsoids (farthest back
+//      minus nearest front surface) x 15.851, the pysurf GT scale, i.e. the unit the network's predicted thickness is
+//      in (option: the volume-matched chord sum in the v2 input unit, ~5x thinner).
 //   3. Truong & Yuksel 2018 narrow-range filter, faithful port (filter_size 40, iters 2, threshold_ratio 20,
 //      particle radius 0.0414, 1d2d + 4 px clean-up), then the frozen depth offset (+3.83 mm subtracted on the mask).
 // Python oracle: SSU_restart Helpers/aniso_render.py (anisotropic_kernels, render_aniso) and
@@ -41,6 +42,12 @@ public class ClassicalSurfaceSettings
     [Tooltip("Footprint clamps in px: min (1), ellipsoid half-width max (96), sphere radius max = this x k (24 -> 72 px at k 3). aniso_render.render_aniso / coverage_probe.render_rows.")]
     public float minRadiusPx = 1f, maxRadiusPx = 96f, sphereMaxRadiusPxPerK = 24f;
 
+    public enum ThicknessMode { DepthRangeGTUnit, VolumeMatchedSum }
+    [Tooltip("Thickness for the shading (the research row scores depth + mask only). DepthRangeGTUnit (default): path length through the ellipsoids (farthest back minus nearest front surface, per pixel) x Thickness Scale GT = the unit the network's predicted thickness is in, so the same kThick is the same material. VolumeMatchedSum: sum of chord lengths x thicknessScale / k^3 (the v2 INPUT unit; ~5x thinner than the network's output on live frames).")]
+    public ThicknessMode thicknessMode = ThicknessMode.DepthRangeGTUnit;
+    [Tooltip("GT thickness per metre of path length: 15.851 = recipe.thickness_scale of the pysurf GT bakes 067a / 060a were trained on (gpupbf_v1_pysurfgt, gpupbf_poolstir_v1_pysurfgt; frozen since 030).")]
+    public float thicknessScaleGT = 15.851288f;
+
     [Tooltip("Truong & Yuksel narrow-range filter on the ellipsoid depth (the '+nr' of t3_aniso+nr).")]
     public bool narrowRange = true;
     [Tooltip("NR filter_size (sigma_world = 0.1 * filter_size * r). 40 = 067c PBF tuning (tuned_wide.json).")]
@@ -71,7 +78,7 @@ public sealed class ClassicalSurface : IDisposable
     readonly int kAniso, kProject, kClear, kRaster, kResolve, kNR1D, kNR2D, kPack;
 
     ComputeBuffer posBuf, cellStartBuf, cellCountBuf, cellIdxBuf, cellOfBuf, kernBuf, projBuf;
-    ComputeBuffer keyBuf, thickFixBuf, splatBuf, maskBuf, thickBuf, dA, dB, shadeDepthBuf;
+    ComputeBuffer keyBuf, thickFixBuf, backKeyBuf, splatBuf, maskBuf, thickBuf, dA, dB, shadeDepthBuf;
     RenderTexture outRT;
     int capN, capCells, H, W, count;
     float[] posStage = new float[0];
@@ -130,7 +137,7 @@ public sealed class ClassicalSurface : IDisposable
         ReleaseImage();
         H = h; W = w;
         int n = H * W;
-        keyBuf = new ComputeBuffer(n, 4); thickFixBuf = new ComputeBuffer(n, 4);
+        keyBuf = new ComputeBuffer(n, 4); thickFixBuf = new ComputeBuffer(n, 4); backKeyBuf = new ComputeBuffer(n, 4);
         splatBuf = new ComputeBuffer(n, 4); maskBuf = new ComputeBuffer(n, 4); thickBuf = new ComputeBuffer(n, 4);
         dA = new ComputeBuffer(n, 4); dB = new ComputeBuffer(n, 4); shadeDepthBuf = new ComputeBuffer(n, 4);
         outRT = new RenderTexture(W, H, 0, RenderTextureFormat.ARGBFloat)
@@ -140,9 +147,9 @@ public sealed class ClassicalSurface : IDisposable
 
     void ReleaseImage()
     {
-        keyBuf?.Release(); thickFixBuf?.Release(); splatBuf?.Release(); maskBuf?.Release(); thickBuf?.Release();
+        keyBuf?.Release(); thickFixBuf?.Release(); backKeyBuf?.Release(); splatBuf?.Release(); maskBuf?.Release(); thickBuf?.Release();
         dA?.Release(); dB?.Release(); shadeDepthBuf?.Release();
-        keyBuf = thickFixBuf = splatBuf = maskBuf = thickBuf = dA = dB = shadeDepthBuf = null;
+        keyBuf = thickFixBuf = backKeyBuf = splatBuf = maskBuf = thickBuf = dA = dB = shadeDepthBuf = null;
         if (outRT != null) { outRT.Release(); UnityEngine.Object.DestroyImmediate(outRT); outRT = null; }
     }
 
@@ -305,10 +312,13 @@ public sealed class ClassicalSurface : IDisposable
         cs.SetFloat("_SphMaxRpx", (float)(s.sphereMaxRadiusPxPerK * (double)s.radiusMult));
         double k3 = s.radiusMult * (double)s.radiusMult * s.radiusMult;
         cs.SetFloat("_ThickPerM", (float)(thicknessScale / k3));
+        cs.SetInt("_ThickMode", s.thicknessMode == ClassicalSurfaceSettings.ThicknessMode.DepthRangeGTUnit ? 0 : 1);
+        cs.SetFloat("_ThickGT", s.thicknessScaleGT);
 
         int gx = (W + 7) / 8, gy = (H + 7) / 8;
         cs.SetBuffer(kClear, "_DepthKey", keyBuf);
         cs.SetBuffer(kClear, "_ThickFix", thickFixBuf);
+        cs.SetBuffer(kClear, "_BackKey", backKeyBuf);
         cs.Dispatch(kClear, gx, gy, 1);
 
         if (n > 0)
@@ -321,11 +331,13 @@ public sealed class ClassicalSurface : IDisposable
             cs.SetBuffer(kRaster, "_Proj", projBuf);
             cs.SetBuffer(kRaster, "_DepthKey", keyBuf);
             cs.SetBuffer(kRaster, "_ThickFix", thickFixBuf);
+            cs.SetBuffer(kRaster, "_BackKey", backKeyBuf);
             cs.Dispatch(kRaster, RASTER_GROUPS_X, (n + RASTER_GROUPS_X - 1) / RASTER_GROUPS_X, 1);
         }
 
         cs.SetBuffer(kResolve, "_DepthKey", keyBuf);
         cs.SetBuffer(kResolve, "_ThickFix", thickFixBuf);
+        cs.SetBuffer(kResolve, "_BackKey", backKeyBuf);
         cs.SetBuffer(kResolve, "_SplatDepth", splatBuf);
         cs.SetBuffer(kResolve, "_DOut", dA);
         cs.SetBuffer(kResolve, "_Mask", maskBuf);
@@ -447,11 +459,13 @@ public sealed class ClassicalSurface : IDisposable
             Sync();
             tWhole += swt.Elapsed.TotalMilliseconds;
         }
+        double tSync = 0;                      // the bare round trip every synced number above contains once
+        for (int rep = 0; rep < reps; rep++) { swt.Restart(); Sync(); tSync += swt.Elapsed.TotalMilliseconds; }
         double k = 1.0 / Math.Max(reps, 1);
         // the 'nr' timing ran the whole Render with NR on: subtract the splat-only time for the NR share
         return $"{{\"reps\":{reps},\"N\":{n},\"H\":{H},\"W\":{W},\"grid_cpu_ms\":{tGrid * k:F3},\"upload_ms\":{tUp * k:F3}," +
                $"\"aniso_ms\":{tAniso * k:F3},\"splat_ms\":{tSplat * k:F3},\"render_with_nr_ms\":{tNR * k:F3}," +
                $"\"nr_ms\":{(tNR - tSplat) * k:F3},\"whole_run_synced_ms\":{tWhole * k:F3},\"whole_run_cpu_ms\":{tWholeCpu * k:F3}," +
-               $"\"grid_cells\":{LastGridCells}}}";
+               $"\"sync_roundtrip_ms\":{tSync * k:F3},\"grid_cells\":{LastGridCells}}}";
     }
 }
