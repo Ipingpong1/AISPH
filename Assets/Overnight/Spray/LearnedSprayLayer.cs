@@ -66,6 +66,7 @@ public sealed class LearnedSprayLayer : IDisposable
     public int Alive => nd;
     public int Visible { get; private set; }
     public int LastEvents, LastBorn, LastDropped, KillWall, KillObst, KillMerge, KillAge;
+    public long TotalEvents, TotalBorn, TotalDropped, TotalWall, TotalObst, TotalMerge, TotalAge;   // since Reset
     public double LastRateSum;                     // sum of the (capped) Poisson means this step
     public double NFull => nFull;
     public double MinHeight => minH;
@@ -136,7 +137,11 @@ public sealed class LearnedSprayLayer : IDisposable
         modelAsset = asset; backend = be;
     }
 
-    public void Reset() { nd = 0; Visible = 0; LastEvents = LastBorn = LastDropped = 0; KillWall = KillObst = KillMerge = KillAge = 0; }
+    public void Reset()
+    {
+        nd = 0; Visible = 0; LastEvents = LastBorn = LastDropped = 0; KillWall = KillObst = KillMerge = KillAge = 0;
+        TotalEvents = TotalBorn = TotalDropped = TotalWall = TotalObst = TotalMerge = TotalAge = 0;
+    }
 
     public void Dispose() { worker?.Dispose(); worker = null; modelAsset = null; }
 
@@ -453,6 +458,7 @@ public sealed class LearnedSprayLayer : IDisposable
             int ne = Poisson(lam);
             for (int e = 0; e < ne; e++) BirthEvent(i, w, ps);
         }
+        TotalEvents += LastEvents; TotalBorn += LastBorn; TotalDropped += LastDropped;
     }
 
     // one event of parent i: component, (dx, dv) ~ N(mu, sigma^2) in the local frame, size bin, k, blob
@@ -557,6 +563,7 @@ public sealed class LearnedSprayLayer : IDisposable
             dPos[w] = x; dVel[w] = v; dAge[w] = age; w++;
         }
         nd = w; Visible = w;
+        TotalWall += KillWall; TotalObst += KillObst; TotalMerge += KillMerge; TotalAge += KillAge;
     }
 
     bool InsideObstacle(Vector3 x)
