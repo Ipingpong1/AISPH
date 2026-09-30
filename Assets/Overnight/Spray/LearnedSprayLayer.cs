@@ -610,20 +610,26 @@ public sealed class LearnedSprayLayer : IDisposable
         return false;
     }
 
-    // ---------------------------------------------------------------- composite into the SSFR field
-    int[] touched = new int[0]; float[] zFront = new float[0], zChord = new float[0], zSpeed = new float[0];
+    // ---------------------------------------------------------------- droplets into a screen field
+    int[] touched = new int[0], prevOverlay = new int[0]; int nPrevOverlay;
+    float[] zFront = new float[0], zChord = new float[0], zSpeed = new float[0];
+    float[] zNx = new float[0], zNy = new float[0], zNz = new float[0];   // view-space normal of the nearest droplet
+    public int DrawnPixels { get; private set; }
 
-    /// <summary>Ray-cast every drawn droplet as a sphere into the field texture pixels (texture rows, row 0 = BOTTOM;
-    /// r = depth along the camera forward [sim m], g = thickness, b = alpha, a = speed) — the layout
-    /// FluidSceneMVP.ProcessPrediction uploads. Only pixels where a droplet is IN FRONT of the bulk (or where there is
-    /// no bulk) change: depth = nearest droplet front, thickness += chord x thicknessScale, alpha = 1.
-    /// minRadiusPx keeps far droplets at least that big (footprint only); radiusScale scales r_d for display.</summary>
-    public void Composite(Color[] px, int W, int H, Vector3 eye, Vector3 right, Vector3 up, Vector3 fwd, float focal,
-                          float aspect, float thicknessScale, float minRadiusPx, float radiusScale)
+    // Ray-cast every drawn droplet (age >= 1) as a sphere (paraxial, as SplatV2) from the given camera; per pixel keep
+    // the nearest front and the summed chord of the droplets IN FRONT of the bulk field `bulk` (texture rows, row 0 =
+    // bottom; r = depth along the camera forward [sim m], b = alpha). Fills zFront / zChord / zSpeed / touched.
+    int Raster(Color[] bulk, int W, int H, Vector3 eye, Vector3 right, Vector3 up, Vector3 fwd, float focal, float aspect,
+               float minRadiusPx, float radiusScale)
     {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
         int HW = W * H;
-        if (zFront.Length != HW) { zFront = new float[HW]; zChord = new float[HW]; zSpeed = new float[HW]; touched = new int[HW]; for (int i = 0; i < HW; i++) zFront[i] = float.MaxValue; }
+        if (zFront.Length != HW)
+        {
+            zFront = new float[HW]; zChord = new float[HW]; zSpeed = new float[HW]; touched = new int[HW]; prevOverlay = new int[HW];
+            zNx = new float[HW]; zNy = new float[HW]; zNz = new float[HW];
+            nPrevOverlay = 0;
+            for (int i = 0; i < HW; i++) zFront[i] = float.MaxValue;
+        }
         int nt = 0;
         float halfH = 0.5f * H, pxPerUnit = focal * halfH;
         float rW = (float)rd * Mathf.Max(radiusScale, 1e-3f);
@@ -657,15 +663,33 @@ public sealed class LearnedSprayLayer : IDisposable
                     float hh = Mathf.Sqrt(Mathf.Max(rE2 - s2, 0f));
                     float front = depth - hh;
                     int ti = (H - 1 - ty) * W + tx;                  // texture row 0 = bottom
-                    Color f = px[ti];
+                    Color f = bulk[ti];
                     if (f.b >= 0.5f && front >= f.r) continue;        // behind / inside the predicted bulk
                     if (zFront[ti] == float.MaxValue) { touched[nt++] = ti; zChord[ti] = 0f; zSpeed[ti] = 0f; }
-                    if (front < zFront[ti]) zFront[ti] = front;
+                    if (front < zFront[ti])
+                    {   // paraxial sphere normal at this pixel, view space (x right, y up, z towards the camera)
+                        zFront[ti] = front;
+                        float inv = 1f / Mathf.Max(rEff, 1e-9f);
+                        zNx[ti] = dx * dScale * inv; zNy[ti] = -dy * dScale * inv; zNz[ti] = hh * inv;
+                    }
                     zChord[ti] += 2f * hh;
                     if (spd > zSpeed[ti]) zSpeed[ti] = spd;
                 }
             }
         }
+        DrawnPixels = nt;
+        return nt;
+    }
+
+    /// <summary>FIELD mode: droplets merged INTO the bulk field `px` (the layout FluidSceneMVP.ProcessPrediction uploads).
+    /// Only pixels where a droplet is in front of the bulk (or there is no bulk) change: depth = nearest droplet front,
+    /// thickness = bulk thickness + chord x thicknessScale, alpha = 1. Caveat: where scene geometry hides the bulk but not
+    /// the droplet, the droplet pixel still carries the hidden bulk's thickness (tint + large refraction offset).</summary>
+    public void Composite(Color[] px, int W, int H, Vector3 eye, Vector3 right, Vector3 up, Vector3 fwd, float focal,
+                          float aspect, float thicknessScale, float minRadiusPx, float radiusScale)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        int nt = Raster(px, W, H, eye, right, up, fwd, focal, aspect, minRadiusPx, radiusScale);
         for (int t = 0; t < nt; t++)
         {
             int ti = touched[t];
@@ -674,10 +698,32 @@ public sealed class LearnedSprayLayer : IDisposable
             px[ti] = new Color(zFront[ti], thick, 1f, Mathf.Max(f.b >= 0.5f ? f.a : 0f, zSpeed[ti]));
             zFront[ti] = float.MaxValue;
         }
-        DrawnPixels = nt;
         MsComposite = (float)sw.Elapsed.TotalMilliseconds;
     }
-    public int DrawnPixels { get; private set; }
+
+    /// <summary>OVERLAY mode: a droplet-only field (same layout; background = 0) of the droplets in front of the bulk
+    /// field `bulk`, for shading as its own thin transparent layer over the composited bulk + scene. Thickness = the
+    /// droplets' own chord x thicknessScale. `outPx` must be all-zero on the first call; only the previous call's
+    /// pixels are cleared afterwards.</summary>
+    public void CompositeOverlay(Color[] bulk, Color[] outPx, int W, int H, Vector3 eye, Vector3 right, Vector3 up,
+                                 Vector3 fwd, float focal, float aspect, float thicknessScale, float minRadiusPx, float radiusScale,
+                                 Color[] outNrm = null)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        if (zFront.Length == W * H)
+            for (int t = 0; t < nPrevOverlay; t++) { outPx[prevOverlay[t]] = default; if (outNrm != null) outNrm[prevOverlay[t]] = default; }
+        int nt = Raster(bulk, W, H, eye, right, up, fwd, focal, aspect, minRadiusPx, radiusScale);
+        for (int t = 0; t < nt; t++)
+        {
+            int ti = touched[t];
+            outPx[ti] = new Color(zFront[ti], zChord[ti] * thicknessScale, 1f, zSpeed[ti]);
+            if (outNrm != null) outNrm[ti] = new Color(zNx[ti], zNy[ti], zNz[ti], 1f);
+            zFront[ti] = float.MaxValue;
+            prevOverlay[t] = ti;
+        }
+        nPrevOverlay = nt;
+        MsComposite = (float)sw.Elapsed.TotalMilliseconds;
+    }
 
     // ---------------------------------------------------------------- RNG
     static ulong SplitMix(ref ulong z)
