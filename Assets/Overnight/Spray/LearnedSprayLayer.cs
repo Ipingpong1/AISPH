@@ -52,6 +52,8 @@ public sealed class LearnedSprayLayer : IDisposable
     public int substeps = 4;
     public double frameDt = 1.0 / 25.0;            // the emitter's frame (s); = 1 / GpuSphProvider.simHz
     public float rateCap = 50f;                    // per-particle Poisson mean cap, x max(s_R, 1) (4e / 4f)
+    public int batchQuantum = 4096;                // MLP batch padded up to a multiple of this: a bounded set of input
+                                                   // shapes for the Inference Engine worker (padded rows are ignored)
     public Vector3 gravity = new Vector3(0f, -9.81f, 0f);
     public Vector3 domainMin = Vector3.zero, domainMax = new Vector3(3f, 3f, 3f);
     public bool cullObstacles = true, cullMerge = true;
@@ -94,8 +96,8 @@ public sealed class LearnedSprayLayer : IDisposable
     double nFull, minH;
     float[] X = new float[0];
     float[] packed = new float[0];
-    public float[] Features => X;                  // [n, 124] of the last Step / ComputeFeatures
-    public float[] Packed => packed;               // [n, 63]
+    public float[] Features => X;                  // [n, 124] of the last Step / ComputeFeatures (padded rows follow)
+    public float[] Packed => packed;               // [n, 63] (padded rows follow)
     public int[] Knn => knn;                       // [n, 16], -1 = invalid
     public double[] NHat => nhat;                  // [n, 3] world
     public int Count => n;
@@ -143,7 +145,11 @@ public sealed class LearnedSprayLayer : IDisposable
         TotalEvents = TotalBorn = TotalDropped = TotalWall = TotalObst = TotalMerge = TotalAge = 0;
     }
 
-    public void Dispose() { worker?.Dispose(); worker = null; modelAsset = null; }
+    public void Dispose()
+    {
+        inputT?.Dispose(); inputT = null; inputRows = -1;
+        worker?.Dispose(); worker = null; modelAsset = null;
+    }
 
     // =====================================================================================================
     // Step: one solver frame
@@ -185,16 +191,23 @@ public sealed class LearnedSprayLayer : IDisposable
     public void RunMlp()
     {
         if (worker == null) throw new InvalidOperationException("LearnedSprayLayer: SetModel first");
-        if (packed.Length != n * NPack) packed = new float[n * NPack];
+        int nPad = PaddedRows(n);
+        if (packed.Length != nPad * NPack) packed = new float[nPad * NPack];
         if (n == 0) return;
-        using (var input = new Tensor<float>(new TensorShape(n, NFeat), X))
+        // one persistent input tensor per padded shape (re-uploaded in place): no per-frame GPU buffer churn
+        if (inputT == null || inputRows != nPad)
         {
-            worker.Schedule(input);
-            var o = worker.PeekOutput("packed") as Tensor<float>;
-            using (var cpu = o.ReadbackAndClone())
-                cpu.AsReadOnlyNativeArray().CopyTo(packed);
+            inputT?.Dispose();
+            inputT = new Tensor<float>(new TensorShape(nPad, NFeat), X);
+            inputRows = nPad;
         }
+        else inputT.Upload(X);
+        worker.Schedule(inputT);
+        var o = worker.PeekOutput("packed") as Tensor<float>;
+        using (var cpu = o.ReadbackAndClone())
+            cpu.AsReadOnlyNativeArray().CopyTo(packed);
     }
+    Tensor<float> inputT; int inputRows = -1;
 
     // ---------------------------------------------------------------- coarse state + grid
     void LoadCoarse(float[] data, int off, int count, float rCoarse)
@@ -208,7 +221,8 @@ public sealed class LearnedSprayLayer : IDisposable
             cnt = new int[n]; cntSorted = new int[n]; ita = new double[n]; iwc = new double[n]; surf = new bool[n];
             knn = new int[n * KNN]; cellOf = new int[n]; sorted = new int[n];
         }
-        if (X.Length != n * NFeat) X = new float[n * NFeat];
+        int nPad = PaddedRows(n);
+        if (X.Length != nPad * NFeat) X = new float[nPad * NFeat];   // rows >= n stay zero (or stale) and are ignored
         for (int i = 0; i < n; i++)
         {
             int b = off + i * 7;
@@ -263,6 +277,12 @@ public sealed class LearnedSprayLayer : IDisposable
     }
 
     static int Clampi(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
+
+    int PaddedRows(int rows)
+    {
+        int q = Math.Max(batchQuantum, 1);
+        return Math.Max(q, (rows + q - 1) / q * q);
+    }
 
     void ForRange(int count, int grain, Action<int, int> body)
     {

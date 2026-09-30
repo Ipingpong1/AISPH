@@ -24,7 +24,7 @@ public partial class FluidSceneMVP
     public ModelAsset sprayModel;
     [Tooltip("Inference Engine backend for the emitter MLP (124 -> 256x3 -> heads, one row per coarse particle per solver frame).")]
     public BackendType sprayBackend = BackendType.GPUCompute;
-    [Tooltip("Multiplier s_R on the emitter's Poisson rate. 2.9 = the 4f LOR arm (fitted on DFSPH TRAIN scenes so the outside-silhouette spray area matched GT). The live GPU-PBF pool is a transfer from that training distribution, so this is a user knob, not a calibrated value.")]
+    [Tooltip("Multiplier s_R on the emitter's Poisson rate. Default 2.9 = the 4f LOR arm, a DFSPH SCREEN-AREA calibration (fitted on DFSPH train scenes so the outside-silhouette spray area matched GT; emitter L paints small blobs). Here it is a look choice, not a calibration: on Unity-PBF pools emitter L already over-produces spray EVENTS 2.1-2.7x at s_R = 1 (SSU_restart Experiments/Overnight0930/G1_pbf_rs/emitter_transfer.json), so the event-count-matched value is ~0.4 and 2.9 gives ~6-8x the dense PBF event count.")]
     public float sprayRateScale = 2.9f;
     [Tooltip("Outward launch speed u_o [m/s] added along the parent's colour-field normal n^ (4f LOR: 3.0). 0 = the 4e emitter as trained.")]
     public float sprayLaunchSpeed = 3f;
