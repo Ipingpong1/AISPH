@@ -17,7 +17,7 @@
 //   material); else derived from the classical thickness with the network path's own rule (1.2 / median, same lock).
 //   Classical thickness (shading only; the research row scores depth + mask) = path length through the ellipsoids x
 //   15.851, the pysurf GT scale 067a / 060a were trained on, i.e. the network's own thickness unit (see ClassicalSurface).
-// Foam (G / FoamLayer): works in both modes; in classical mode its fluid depth is a synchronous readback.
+// Foam (G / FoamLayer): works in both modes; in classical mode its fluid depth is an async readback (one frame late).
 // Learned spray (G2, key J): if present and on, the classical field is read back into the CPU field so the spray
 //   layer composites its droplets exactly as it does for the network (found by reflection: no compile-time coupling).
 // Not in classical mode: V (raw input), the temporal stage, OnInferred / LastPred taps (LiveClipRecorder).
