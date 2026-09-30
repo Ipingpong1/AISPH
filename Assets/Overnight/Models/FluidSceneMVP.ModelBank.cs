@@ -1,4 +1,4 @@
-// FluidSceneMVP.ModelBank.cs — overnight 2026-09-30 (main session, G1): runtime network switcher, key M.
+// FluidSceneMVP.ModelBank.cs — overnight 2026-09-30 (main session, G1): runtime network switcher, key K (M / N are ObstacleSpawner's sphere / box keys).
 // Cycles the network between the scene's modelAsset (entry 0) and every ModelAsset under Resources/<modelBankResources>
 // (sorted by name). Tonight's bank: the pool fine-tunes of 2026-09-26 (FT-THIN, FT-TC; base 067a) and the PBF FT-RS arms
 // of 2026-09-30 (pbf_rs_ft_rs = re-seeded in Unity's own GPU PBF, frozen recipe; pbf_rs_ft_rss = + quasi-static settle).
@@ -14,8 +14,8 @@ using Unity.InferenceEngine;
 
 public partial class FluidSceneMVP
 {
-    [Header("Model bank (overnight 2026-09-30, key M) — cycles the network")]
-    [Tooltip("Resources folder with the switchable ONNX ModelAssets (square 512, V2 splat, 067a union stats) and optional <name>_stats TextAssets. Key M cycles: scene model -> bank models (by name) -> scene model.")]
+    [Header("Model bank (overnight 2026-09-30, key K) — cycles the network")]
+    [Tooltip("Resources folder with the switchable ONNX ModelAssets (square 512, V2 splat, 067a union stats) and optional <name>_stats TextAssets. Key K cycles: scene model -> bank models (by name) -> scene model.")]
     public string modelBankResources = "SSU_ModelBank";
 
     ModelAsset[] bankModels;
