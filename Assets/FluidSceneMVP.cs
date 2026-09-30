@@ -33,6 +33,7 @@
 // Controls (when flyControls is on): WASD fly (+Q/E world down/up, Shift ×3), hold RMB +
 // mouse to look, P pause, R restart, V shade raw model input instead of the prediction,
 // B bilateral smoothing, [ / ] playback fps −/+5, G whitewater layer (FoamLayer), H whitewater only.
+// J learned spray droplets (G2 learned spray, Overnight/Spray/FluidSceneMVP.Spray.cs; off by default).
 
 using System;
 using System.Collections;
@@ -41,7 +42,7 @@ using UnityEngine;
 using UnityEngine.InputSystem;
 using Unity.InferenceEngine;
 
-public class FluidSceneMVP : MonoBehaviour
+public partial class FluidSceneMVP : MonoBehaviour
 {
     // ---------- inspector ----------
 
@@ -866,6 +867,7 @@ public class FluidSceneMVP : MonoBehaviour
             double var = (dSumSq - dSum * dSum / fgCount) / (fgCount - 1);
             bilateralSigmaR = Mathf.Max(bilateralRangeScale * (float)Math.Sqrt(Math.Max(var, 0.0)), 1e-3f);
         }
+        SprayComposite();   // G2 learned spray: droplets into the field before upload (no-op while off)
         fieldTex.SetPixels(px);
         fieldTex.Apply(false, false);
 
@@ -1031,7 +1033,7 @@ public class FluidSceneMVP : MonoBehaviour
                  $"{(bilateralSmoothing ? "   BILATERAL" : "")}{(paused ? "   PAUSED" : "")}" +
                  $"{(capturing ? "   CAPTURING" : "")}" +
                  (foamEnabled ? $"   FOAM{(foamOnlyView ? " ONLY" : "")} {foam.Alive} ({foam.Spray}s/{foam.Foam}f/{foam.Bubble}b) " +
-                                $"+{foam.SpawnedTa}ta/{foam.SpawnedWc}wc  {foam.LastStepMs:F1}+{foam.LastSplatMs:F1} ms" : "");
+                                $"+{foam.SpawnedTa}ta/{foam.SpawnedWc}wc  {foam.LastStepMs:F1}+{foam.LastSplatMs:F1} ms" : "") + SprayStatus();   // G2 learned spray
     }
 
     void SetShadeParams(Material m)
@@ -1106,6 +1108,7 @@ public class FluidSceneMVP : MonoBehaviour
             if (kb.rKey.wasPressedThisFrame) ResetSim();
             if (kb.gKey.wasPressedThisFrame) ToggleFoam();
             if (kb.hKey.wasPressedThisFrame) ToggleFoamOnlyView();
+            if (kb.jKey.wasPressedThisFrame) ToggleSpray();   // G2 learned spray
             if (kb.leftBracketKey.wasPressedThisFrame) playbackFps = Mathf.Max(1f, playbackFps - 5f);
             if (kb.rightBracketKey.wasPressedThisFrame) playbackFps += 5f;
 
@@ -1167,6 +1170,7 @@ public class FluidSceneMVP : MonoBehaviour
 
     void OnDestroy()
     {
+        SprayShutdown();   // G2 learned spray
         pendingInput?.Dispose();
         worker?.Dispose();
         if (fieldTex != null) Destroy(fieldTex);
