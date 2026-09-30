@@ -119,7 +119,8 @@ public static class LearnedSprayParity
     /// rate_sum ms_feat ms_mlp ms_birth ms_fly.</summary>
     public static string Sequence(string recordsPath, int f0, int f1, string outPath, float rc, ulong seed,
                                   float rateScale = 2.9f, float launch = 3f,
-                                  string modelResource = "spray_emitter_L_s0", string backend = "GPUCompute")
+                                  string modelResource = "spray_emitter_L_s0", string backend = "GPUCompute",
+                                  int[] dumpStates = null)
     {
         var data = ReadBake(recordsPath, out var counts);
         var sb = new StringBuilder("frame alive born events wall obst merge age rate_sum ms_feat ms_mlp ms_birth ms_fly\n");
@@ -130,6 +131,7 @@ public static class LearnedSprayParity
             for (int f = f0; f < Math.Min(f1, data.Count); f++)
             {
                 L.Step(data[f], 0, counts[f], rc);
+                if (dumpStates != null && Array.IndexOf(dumpStates, f) >= 0) WriteDroplets(L, outPath + $".state_f{f:D4}.bin");
                 // after Step: survivors of the flight/cull = Visible (what is drawn with this frame), + LastBorn newborns
                 sb.Append($"{f} {L.Visible} {L.LastBorn} {L.LastEvents} {L.KillWall} {L.KillObst} {L.KillMerge} {L.KillAge} {L.LastRateSum:F5} " +
                           $"{L.MsFeatures:F3} {L.MsMlp:F3} {L.MsBirths:F3} {L.MsDroplets:F3}\n");
@@ -141,6 +143,17 @@ public static class LearnedSprayParity
         steps = Math.Max(steps, 1);
         string ms = $"\"features\":{tf / steps:F3},\"mlp\":{tm / steps:F3},\"births\":{tb / steps:F3},\"droplets\":{td / steps:F3}";
         return "{\"frames\":[" + f0 + "," + f1 + "],\"mean_ms\":{" + ms + "},\"path\":\"" + outPath + "\"}";
+    }
+
+    // droplet state after a Step: int32 n, then per droplet px py pz vx vy vz (float32) age (int32)
+    static void WriteDroplets(LearnedSprayLayer L, string path)
+    {
+        using (var bw = new BinaryWriter(File.Create(path)))
+        {
+            int n = L.Alive; bw.Write(n);
+            var p = L.DropletPositions; var v = L.DropletVelocities; var a = L.DropletAges;
+            for (int i = 0; i < n; i++) { bw.Write(p[i].x); bw.Write(p[i].y); bw.Write(p[i].z); bw.Write(v[i].x); bw.Write(v[i].y); bw.Write(v[i].z); bw.Write(a[i]); }
+        }
     }
 
     /// <summary>Synthetic known answers (no model needed except for none): returns JSON with each check and pass.</summary>

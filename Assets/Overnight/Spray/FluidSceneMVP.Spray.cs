@@ -36,6 +36,8 @@ public partial class FluidSceneMVP
     [Tooltip("Seed of the birth sampler (Poisson counts, mixture, sizes, blob jitter).")]
     public int spraySeed = 0;
 
+    [Serializable] class SprayMeta { public float sig_in; }
+
     LearnedSprayLayer spray;
     GpuSphProvider sprayGpu;                 // provider whose OnSolverFrame we are subscribed to
     float spraySolverTimeLast = -1f;
@@ -59,10 +61,17 @@ public partial class FluidSceneMVP
             if (asset == null) throw new Exception($"emitter model '{sprayModelResource}' not found under any Resources folder");
             spray = new LearnedSprayLayer((ulong)(uint)spraySeed);
             spray.SetModel(asset, sprayBackend);
+            // sigma_in belongs to the emitter's training data: export_emitter.py writes it into <name>_meta.json
+            var metaTA = Resources.Load<TextAsset>(asset.name + "_meta");
+            if (metaTA != null)
+            {
+                var m = JsonUtility.FromJson<SprayMeta>(metaTA.text);
+                if (m != null && m.sig_in > 0f) spray.sigIn = m.sig_in;
+            }
             sprayGpu = provider as GpuSphProvider;
             if (sprayGpu != null) sprayGpu.OnSolverFrame += OnSpraySolverFrame;
             spraySolverTimeLast = -1f; sprayPlayFrameLast = -1;
-            Debug.Log($"FluidSceneMVP: learned spray ON — model {asset.name}, backend {sprayBackend}, r_c {SprayCoarseRadius:F4}, " +
+            Debug.Log($"FluidSceneMVP: learned spray ON — model {asset.name}, backend {sprayBackend}, r_c {SprayCoarseRadius:F4}, sig_in {spray.sigIn:F4}, " +
                       $"stepping {(sprayGpu != null ? "per GPU solver frame" : "per played frame")}");
             return true;
         }
