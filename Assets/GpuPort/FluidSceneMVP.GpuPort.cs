@@ -45,7 +45,7 @@ public partial class FluidSceneMVP
     CustomSampler SamplerNet, SamplerSpray;   // created in EnsureGpuPath (main thread)
 
     public bool GpuPathEnabled => gpuPath;
-    public void ToggleGpuPath() { gpuPath = !gpuPath; gpuError = null; }
+    public void ToggleGpuPath() { gpuPath = !gpuPath; gpuError = null; if (!gpuPath) DisposeGpuSpray(); }   // the CPU spray resumes on its own
 
     /// <summary>True when this frame runs the GPU chain.</summary>
     bool GpuPathActive => gpuPath && useV2 && ActiveSpread == 0 && OnInferred == null && EnsureGpuPath();

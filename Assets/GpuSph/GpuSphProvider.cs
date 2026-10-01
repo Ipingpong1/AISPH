@@ -65,6 +65,9 @@ public class GpuSphProvider : ParticleFrameProvider
     /// (solverFrameIndex, solverTime, records, count). Subscribing costs one readback per solver frame,
     /// which GetFrame then reuses; with no subscriber the Tick loop is unchanged.</summary>
     public event Action<int, float, float[], int> OnSolverFrame;
+    /// <summary>GPU1001: raised once per SOLVER frame right after the step, with (solverFrameIndex, solverTime) and NO
+    /// readback — subscribers read Solver.PositionBuffer etc. on the GPU (the GPU spray layer).</summary>
+    public event Action<int, float> OnSolverStepGpu;
     int solverFrameIdx;
     public int ActiveParticles => solver != null ? solver.Count : 0;
     public GpuSphSolver Solver { get { EnsureInit(); return solver; } }
@@ -135,6 +138,7 @@ public class GpuSphProvider : ParticleFrameProvider
             solver.gravity = gravity;
             solver.Step(step);
             recordsDirty = true;
+            OnSolverStepGpu?.Invoke(solverFrameIdx, solverTime);
             if (OnSolverFrame != null)
             {
                 cachedCount = solver.ReadbackFrame(records, posStage, velStage, densStage);

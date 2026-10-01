@@ -1,0 +1,650 @@
+// GpuSpray.compute — GPU1001 (2026-10-01): the learned spray layer (Assets/Overnight/Spray/LearnedSprayLayer.cs, G2:
+// 4e emitter L + 4f LOR knobs) on the GPU. Same order per SOLVER frame as the C# layer (= spray3d / spray4f oracle):
+//   grid on THIS coarse state -> flight + culls of the droplets already born (pool A -> pool B, compacting) ->
+//   124 features (float32 here; double in C#) straight into the MLP input tensor -> [MLP, Inference Engine] ->
+//   births: phase 1 one thread per particle samples the Poisson events (event buffer), phase 2 one group per event
+//   allocates its k droplets (exact cap semantics via CAS) and places the lattice blob into pool B.
+// Every rendered frame: raster of the drawn droplets (age >= 1) as paraxial spheres against the bulk field:
+//   min front depth (order-preserving key), summed chord, max speed, then the nearest droplet's analytic normal;
+//   resolved into the Overlay RTs (G2SprayShade reads them) or merged into the bulk field (Field mode).
+// RNG: a counter-based PCG hash per (seed, step, round, particle / event, droplet) — statistically equivalent to the
+// C# xoshiro stream, not bitwise (gate P3). Gates: SSU_restart/Experiments/GPU1001/PLAN.md P1-P5.
+#pragma kernel ResetStep
+#pragma kernel GridClear
+#pragma kernel GridCount
+#pragma kernel GridScan
+#pragma kernel GridScatter
+#pragma kernel Advance
+#pragma kernel FeatA
+#pragma kernel FeatHist
+#pragma kernel FeatPercentile
+#pragma kernel FeatB
+#pragma kernel Births
+#pragma kernel EventArgs
+#pragma kernel Spawn
+#pragma kernel DropArgs
+#pragma kernel RClear
+#pragma kernel RDepth
+#pragma kernel RNormal
+#pragma kernel RResolve
+
+#define NFEAT 124
+#define KNN 16
+#define NPACK 63
+#define NMIX 4
+#define NBINS 10
+#define OFF_LOGITS 1
+#define OFF_MU 5
+#define OFF_LS 29
+#define OFF_SIZE 53
+#define HIST 1024
+#define MAX_OBST 8
+#define SCAN_T 1024
+
+uint FloatToKey(float f) { uint u = asuint(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
+float KeyToFloat(uint k) { return asfloat((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k); }
+
+#define ATOMIC_ADD_F(buf, idx, val)                                                   \
+{                                                                                   \
+    uint _o = buf[idx];                                                             \
+    [loop] for (uint _t = 0; _t < 4096; _t++)                                       \
+    {                                                                               \
+        uint _p;                                                                    \
+        InterlockedCompareExchange(buf[idx], _o, asuint(asfloat(_o) + (val)), _p);  \
+        if (_p == _o) break;                                                        \
+        _o = _p;                                                                    \
+    }                                                                               \
+}
+
+// ---------------------------------------------------------------- RNG (PCG)
+uint Hash(uint v) { uint s = v * 747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }
+float NextU(inout uint s)   // [0, 1), 24 bits
+{
+    s = s * 747796405u + 2891336453u;
+    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    w = (w >> 22u) ^ w;
+    return (w >> 8) * (1.0 / 16777216.0);
+}
+float Normal(inout uint s)  // Box-Muller (no cached spare)
+{
+    float u1 = 1.0 - NextU(s), u2 = NextU(s);
+    return sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2);
+}
+int PoissonInv(float lam, inout uint s)
+{
+    float u = NextU(s), p = exp(-lam), F = p; int k = 0;
+    [loop] while (u > F)
+    {
+        k++; p *= lam / k; F += p;
+        if (k > 2000 || (p < 1e-9 * F && k > lam)) break;   // float accumulation can stall just below u ~ 1
+    }
+    return k;
+}
+// Poisson(lam) as a sum of Poisson(lam / m) pieces (exp(-lam) underflows float32 above ~87; pieces <= 30)
+int Poisson(float lam, inout uint s)
+{
+    if (!(lam > 0)) return 0;
+    int m = (int)ceil(lam / 30.0);
+    float l = lam / m; int k = 0;
+    for (int q = 0; q < m; q++) k += PoissonInv(l, s);
+    return k;
+}
+
+// ---------------------------------------------------------------- parameters
+int _N;                       // coarse particles
+float _Rc, _H, _Rd;           // r_c, h = 4 r_c, r_d
+float3 _Upv, _Ref;            // up = -g/|g|; fixed horizontal axis
+float3 _G;                    // gravity
+float3 _DomMin, _DomMax;
+float3 _GridMin; float _Cell; int3 _Gn; int _Cells;
+float _SR, _Cap, _Launch, _SigIn;
+int _MaxDrops, _MaxEvents, _MergeGrace, _Substeps, _NumObst, _CullObst, _CullMerge;
+float _MergeR2, _MaxAge, _FrameDt;
+uint _Seed, _Step, _Round;
+int _KeepEvents;              // parity: do not reset the event counter between rounds
+
+StructuredBuffer<float3> _PosIn;
+StructuredBuffer<float3> _VelIn;
+
+RWStructuredBuffer<uint> _CellCount;   // cells
+RWStructuredBuffer<uint> _CellStart;   // cells + 1
+RWStructuredBuffer<uint> _CellFill;    // cells
+RWStructuredBuffer<uint> _CellOf;      // N
+RWStructuredBuffer<uint> _Sorted;      // N
+
+RWStructuredBuffer<uint> _Cnt;         // N
+RWStructuredBuffer<float> _Ita;        // N
+RWStructuredBuffer<float4> _NHat;      // N (xyz)
+RWStructuredBuffer<float4> _E1;        // N
+RWStructuredBuffer<float4> _E2;        // N
+RWStructuredBuffer<int> _Knn;          // N * 16
+RWStructuredBuffer<uint> _Hist;        // HIST
+RWStructuredBuffer<uint> _ScalarU;     // [0] min-height key
+RWStructuredBuffer<float> _ScalarF;    // [0] n_full, [1] min height
+RWStructuredBuffer<float> _X;          // [nPad, 124] — the MLP input tensor
+StructuredBuffer<float> _Packed;       // [nPad, 63] — the MLP output tensor
+
+// integers live in uint fields: an int stored as asfloat() bits is a denormal, and the GPU flushes those to 0 (found by
+// gate P3: every event's parent read back as 0)
+struct Event { float4 c; float4 u; uint4 meta; };   // meta = parent, k, comp | bin << 8, round
+RWStructuredBuffer<Event> _Events;
+RWStructuredBuffer<uint> _EventCount;  // [0]
+RWStructuredBuffer<uint> _Args;        // indirect dispatch args (3 uints)
+
+struct Droplet { float4 xa; float3 v; uint id; };   // xyz pos, w age (float); velocity; id (parity)
+StructuredBuffer<Droplet> _PoolIn;
+RWStructuredBuffer<Droplet> _PoolOut;
+StructuredBuffer<uint> _CountIn;       // [0]
+RWStructuredBuffer<uint> _CountOut;    // [0]
+
+// stats: 0 events, 1 event overflow, 2 born, 3 dropped, 4 kill wall, 5 kill obst, 6 kill merge, 7 kill age,
+//        8 sum lambda (float bits), 9 survivors
+RWStructuredBuffer<uint> _Stats;
+
+struct Obst { float4 r0, r1, r2; int shape; float pad; float2 pad2; };
+StructuredBuffer<Obst> _Obst;
+
+StructuredBuffer<float4> _Lat;         // lattice offsets (units of 2 r_d), sorted by |o|
+StructuredBuffer<float4> _LatCum;      // prefix sums (k + 1 entries)
+StructuredBuffer<int> _SizeEdges;      // 11
+
+// ---------------------------------------------------------------- per-step reset
+[numthreads(1, 1, 1)]
+void ResetStep(uint3 id : SV_DispatchThreadID)
+{
+    for (int q = 0; q < 16; q++) _Stats[q] = 0u;
+    _CountOut[0] = 0u;
+    if (_KeepEvents == 0) _EventCount[0] = 0u;
+    _ScalarU[0] = 0xFFFFFFFFu;
+}
+
+// ---------------------------------------------------------------- grid (domain-anchored, cell = h; counting sort)
+int3 CellOfP(float3 p) { return clamp((int3)floor((p - _GridMin) / _Cell), int3(0, 0, 0), _Gn - 1); }
+int CellIndex(int3 c) { return (c.z * _Gn.y + c.y) * _Gn.x + c.x; }
+
+[numthreads(64, 1, 1)]
+void GridClear(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x < _Cells) { _CellCount[id.x] = 0u; }
+    if ((int)id.x < HIST) _Hist[id.x] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void GridCount(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _N) return;
+    uint c = (uint)CellIndex(CellOfP(_PosIn[id.x]));
+    _CellOf[id.x] = c;
+    InterlockedAdd(_CellCount[c], 1u);
+}
+
+groupshared uint gsScan[SCAN_T];
+
+// one group: exclusive scan of _CellCount into _CellStart (cells + 1) and _CellFill
+[numthreads(SCAN_T, 1, 1)]
+void GridScan(uint gi : SV_GroupIndex)
+{
+    int per = (_Cells + SCAN_T - 1) / SCAN_T;
+    int b = (int)gi * per, e = min(b + per, _Cells);
+    uint s = 0;
+    for (int c = b; c < e; c++) s += _CellCount[c];
+    gsScan[gi] = s;
+    GroupMemoryBarrierWithGroupSync();
+    // Hillis-Steele inclusive scan over the per-thread sums
+    for (uint off = 1; off < SCAN_T; off <<= 1)
+    {
+        uint v = gi >= off ? gsScan[gi - off] : 0u;
+        GroupMemoryBarrierWithGroupSync();
+        gsScan[gi] += v;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    uint run = gsScan[gi] - s;   // exclusive prefix of this thread's chunk
+    for (int c2 = b; c2 < e; c2++) { _CellStart[c2] = run; _CellFill[c2] = run; run += _CellCount[c2]; }
+    if (gi == SCAN_T - 1) _CellStart[_Cells] = gsScan[gi];
+}
+
+[numthreads(64, 1, 1)]
+void GridScatter(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _N) return;
+    uint slot;
+    InterlockedAdd(_CellFill[_CellOf[id.x]], 1u, slot);
+    _Sorted[slot] = id.x;
+}
+
+// ---------------------------------------------------------------- flight + culls (pool in -> pool out)
+bool InsideObstacle(float3 x)
+{
+    for (int o = 0; o < _NumObst; o++)
+    {
+        Obst ob = _Obst[o];
+        float3 q = float3(dot(ob.r0.xyz, x) + ob.r0.w, dot(ob.r1.xyz, x) + ob.r1.w, dot(ob.r2.xyz, x) + ob.r2.w);
+        float pq = ob.pad;
+        if (ob.shape == 0) { if (length(q) <= 0.5 + pq) return true; }
+        else if (ob.shape == 1) { if (abs(q.x) <= 0.5 + pq && abs(q.y) <= 0.5 + pq && abs(q.z) <= 0.5 + pq) return true; }
+        else
+        {
+            float rad = sqrt(q.x * q.x + q.z * q.z) - 1.0 / 3.0;
+            if (rad * rad + q.y * q.y <= (1.0 / 6.0 + pq) * (1.0 / 6.0 + pq)) return true;
+        }
+    }
+    return false;
+}
+
+bool NearCoarse(float3 x, float r2)
+{
+    if (_N == 0) return false;
+    int3 c0 = (int3)floor((x - _GridMin) / _Cell);
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        int3 c = c0 + int3(dx, dy, dz);
+        if (any(c < 0) || any(c >= _Gn)) continue;
+        int ci = CellIndex(c);
+        for (uint s = _CellStart[ci], e = _CellStart[ci + 1]; s < e; s++)
+        {
+            float3 d = x - _PosIn[_Sorted[s]];
+            if (dot(d, d) < r2) return true;
+        }
+    }
+    return false;
+}
+
+[numthreads(64, 1, 1)]
+void Advance(uint3 id : SV_DispatchThreadID)
+{
+    uint nIn = _CountIn[0];
+    if (id.x >= nIn) return;
+    Droplet d = _PoolIn[id.x];
+    float3 x = d.xa.xyz, v = d.v;
+    float hs = _FrameDt / max(_Substeps, 1);
+    for (int s = 0; s < _Substeps; s++) { v += _G * hs; x += v * hs; }
+    int age = (int)d.xa.w + 1;
+    float3 lo = _DomMin + _Rd, hi = _DomMax - _Rd;
+    bool wall = x.x < lo.x || x.y < lo.y || x.z < lo.z || x.x > hi.x || x.y > hi.y || x.z > hi.z;
+    bool obst = !wall && _CullObst != 0 && InsideObstacle(x);
+    bool merge = !wall && !obst && _CullMerge != 0 && age >= _MergeGrace && NearCoarse(x, _MergeR2);
+    bool old = !wall && !obst && !merge && age * _FrameDt > _MaxAge;
+    if (wall) { InterlockedAdd(_Stats[4], 1u); return; }
+    if (obst) { InterlockedAdd(_Stats[5], 1u); return; }
+    if (merge) { InterlockedAdd(_Stats[6], 1u); return; }
+    if (old) { InterlockedAdd(_Stats[7], 1u); return; }
+    uint slot;
+    InterlockedAdd(_CountOut[0], 1u, slot);
+    Droplet o; o.xa = float4(x, (float)age); o.v = v; o.id = d.id;
+    _PoolOut[slot] = o;
+    InterlockedAdd(_Stats[9], 1u);
+}
+
+// ---------------------------------------------------------------- features (spray3d.coarse_features)
+float Log1pF(float x) { float u = 1.0 + x; return u == 1.0 ? x : log(u) * (x / (u - 1.0)); }
+
+[numthreads(64, 1, 1)]
+void FeatA(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float h = _H, h2 = h * h;
+    float3 pi_ = _PosIn[i], vi_ = _VelIn[i];
+    uint c0 = 0; float ta = 0; float3 nr = 0;
+    // 16 nearest strictly inside h, ordered by (d2, index): empty slots hold (+big, INT_MAX); a candidate replaces the
+    // worst slot and bubbles down through an UNROLLED compare-swap chain (static indices: no local-array dynamic indexing)
+    float kd[KNN]; int kj[KNN];
+    [unroll] for (int q0 = 0; q0 < KNN; q0++) { kd[q0] = 3.0e38; kj[q0] = 0x7FFFFFFF; }
+    int3 cc = CellOfP(pi_);
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        int3 c = cc + int3(dx, dy, dz);
+        if (any(c < 0) || any(c >= _Gn)) continue;
+        int ci = CellIndex(c);
+        for (uint s = _CellStart[ci], e = _CellStart[ci + 1]; s < e; s++)
+        {
+            int j = (int)_Sorted[s];
+            if (j == i) continue;
+            float3 xx = pi_ - _PosIn[j];
+            float d2 = dot(xx, xx);
+            if (d2 > h2) continue;
+            if (d2 < h2 && (d2 < kd[KNN - 1] || (d2 == kd[KNN - 1] && j < kj[KNN - 1])))
+            {
+                kd[KNN - 1] = d2; kj[KNN - 1] = j;
+                [unroll] for (int q1 = KNN - 1; q1 > 0; q1--)
+                {
+                    bool sw = kd[q1] < kd[q1 - 1] || (kd[q1] == kd[q1 - 1] && kj[q1] < kj[q1 - 1]);
+                    float td = kd[q1]; int tj = kj[q1];
+                    kd[q1] = sw ? kd[q1 - 1] : kd[q1]; kj[q1] = sw ? kj[q1 - 1] : kj[q1];
+                    kd[q1 - 1] = sw ? td : kd[q1 - 1]; kj[q1 - 1] = sw ? tj : kj[q1 - 1];
+                }
+            }
+            float d = max(sqrt(d2), 1e-9);
+            float w = 1.0 - d / h;
+            float3 hh = xx / d;
+            c0++;
+            float3 ww = vi_ - _VelIn[j];
+            float vn = length(ww);
+            float vd = max(vn, 1e-9);
+            ta += vn * (1.0 - dot(ww / vd, hh)) * w;
+            nr += hh * w;
+        }
+    }
+    _Cnt[i] = c0; _Ita[i] = ta;
+    float nm = max(length(nr), 1e-9);
+    _NHat[i] = float4(nr / nm, 0);
+    [unroll] for (int k = 0; k < KNN; k++) _Knn[i * KNN + k] = kd[k] < 1.0e38 ? kj[k] : -1;
+}
+
+[numthreads(64, 1, 1)]
+void FeatHist(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _N) return;
+    InterlockedAdd(_Hist[min(_Cnt[id.x], (uint)(HIST - 1))], 1u);
+    InterlockedMin(_ScalarU[0], FloatToKey(dot(_PosIn[id.x], _Upv)));
+}
+
+// n_full = max(numpy percentile(cnt, 90, linear), 4) from the integer histogram; rank arithmetic in integers so the
+// interpolation weight is exact
+float ValueAtRank(int r)
+{
+    uint acc = 0;
+    for (int v = 0; v < HIST; v++) { acc += _Hist[v]; if ((uint)r < acc) return (float)v; }
+    return (float)(HIST - 1);
+}
+
+[numthreads(1, 1, 1)]
+void FeatPercentile(uint3 id : SV_DispatchThreadID)
+{
+    float nFull = 4.0;
+    if (_N > 0)
+    {
+        int num = (_N - 1) * 9;
+        int lo = num / 10; int hi = min(lo + 1, _N - 1);
+        float g = (num - lo * 10) / 10.0;
+        float a = ValueAtRank(lo), b = ValueAtRank(hi), dba = b - a;
+        float pct = g >= 0.5 ? b - dba * (1.0 - g) : a + dba * g;
+        nFull = max(pct, 4.0);
+    }
+    _ScalarF[0] = nFull;
+    _ScalarF[1] = _N > 0 ? KeyToFloat(_ScalarU[0]) : 0.0;
+}
+
+[numthreads(64, 1, 1)]
+void FeatB(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float h = _H, h2 = h * h;
+    float nFull = _ScalarF[0], minH = _ScalarF[1];
+    float surfCut = 0.75 * nFull;
+    float3 pi_ = _PosIn[i], vi_ = _VelIn[i];
+    float3 ni = _NHat[i].xyz;
+    float vm = length(vi_), vmd = max(vm, 1e-9);
+    float vdn = dot(vi_ / vmd, ni);
+    bool surfI = (float)_Cnt[i] < surfCut;
+    float wc = 0;
+    if (surfI && vdn >= 0.6)
+    {
+        int3 cc = CellOfP(pi_);
+        for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            int3 c = cc + int3(dx, dy, dz);
+            if (any(c < 0) || any(c >= _Gn)) continue;
+            int ci = CellIndex(c);
+            for (uint s = _CellStart[ci], e = _CellStart[ci + 1]; s < e; s++)
+            {
+                int j = (int)_Sorted[s];
+                if (j == i || !((float)_Cnt[j] < surfCut)) continue;
+                float3 xx = pi_ - _PosIn[j];
+                float d2 = dot(xx, xx);
+                if (d2 > h2) continue;
+                float d = max(sqrt(d2), 1e-9);
+                if (dot(xx / d, ni) <= 0) continue;
+                wc += (1.0 - dot(ni, _NHat[j].xyz)) * (1.0 - d / h);
+            }
+        }
+    }
+    // local frame: up = -g, e1 = horizontal velocity direction (fixed axis below 1e-6), e2 = up x e1
+    float vu = dot(vi_, _Upv);
+    float3 hv = vi_ - vu * _Upv;
+    float hn = length(hv);
+    float3 a = hn > 1e-6 ? hv / max(hn, 1e-12) : _Ref;
+    float3 b = cross(_Upv, a);
+    _E1[i] = float4(a, 0); _E2[i] = float4(b, 0);
+    int r = i * NFEAT;
+    float hgt = (dot(pi_, _Upv) - minH) / _Rc;
+    hgt = hgt < 0 ? 0 : (hgt > 60 ? 60 : hgt);
+    float ek = 0.5 * vm * vm;
+    _X[r + 0] = dot(vi_, a);
+    _X[r + 1] = vu;
+    _X[r + 2] = hgt;
+    _X[r + 3] = Log1pF(_Ita[i]);
+    _X[r + 4] = Log1pF(wc);
+    _X[r + 5] = Log1pF(ek);
+    _X[r + 6] = _Cnt[i] / nFull;
+    _X[r + 7] = surfI ? 1.0 : 0.0;
+    _X[r + 8] = dot(vi_, ni) / vmd;
+    _X[r + 9] = dot(ni, a);
+    _X[r + 10] = dot(ni, _Upv);
+    _X[r + 11] = dot(ni, b);
+    for (int k = 0; k < KNN; k++)
+    {
+        int o = r + 12 + 7 * k, j = _Knn[i * KNN + k];
+        if (j < 0) { for (int q = 0; q < 7; q++) _X[o + q] = 0; continue; }
+        float3 dxv = _PosIn[j] - pi_, wv = _VelIn[j] - vi_;
+        _X[o + 0] = dot(dxv, a) / _Rc;
+        _X[o + 1] = dot(dxv, _Upv) / _Rc;
+        _X[o + 2] = dot(dxv, b) / _Rc;
+        _X[o + 3] = dot(wv, a);
+        _X[o + 4] = dot(wv, _Upv);
+        _X[o + 5] = dot(wv, b);
+        _X[o + 6] = 1.0;
+    }
+}
+
+// ---------------------------------------------------------------- births phase 1: events (spray4f.births, LOR knobs)
+[numthreads(64, 1, 1)]
+void Births(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    int r = i * NPACK;
+    float lam = exp(_Packed[r]) * _SR;
+    if (lam > _Cap) lam = _Cap;
+    if (!(lam > 0)) return;
+    ATOMIC_ADD_F(_Stats, 8, lam);
+    uint s = Hash(_Seed ^ Hash(_Step * 0x9E3779B9u ^ Hash(_Round * 0x85EBCA6Bu ^ Hash((uint)i + 0x27D4EB2Fu))));
+    int ne = Poisson(lam, s);
+    if (ne == 0) return;
+    // softmaxes once per particle
+    float w[NMIX]; float mx = -1e30, sm = 0;
+    for (int m = 0; m < NMIX; m++) mx = max(mx, _Packed[r + OFF_LOGITS + m]);
+    for (int m1 = 0; m1 < NMIX; m1++) { w[m1] = exp(_Packed[r + OFF_LOGITS + m1] - mx); sm += w[m1]; }
+    for (int m2 = 0; m2 < NMIX; m2++) w[m2] /= sm;
+    float ps[NBINS]; mx = -1e30; sm = 0;
+    for (int q = 0; q < NBINS; q++) mx = max(mx, _Packed[r + OFF_SIZE + q]);
+    for (int q1 = 0; q1 < NBINS; q1++) { ps[q1] = exp(_Packed[r + OFF_SIZE + q1] - mx); sm += ps[q1]; }
+    for (int q2 = 0; q2 < NBINS; q2++) ps[q2] /= sm;
+    float3 P = _PosIn[i], V = _VelIn[i], e1 = _E1[i].xyz, e2 = _E2[i].xyz, nh = _NHat[i].xyz;
+    for (int e = 0; e < ne; e++)
+    {
+        float u = NextU(s), acc = 0; int comp = 0;
+        for (int m3 = 0; m3 < NMIX; m3++) { acc += w[m3]; if (u > acc) comp++; }
+        comp = min(comp, NMIX - 1);
+        int mo = r + OFF_MU + comp * 6, lo_ = r + OFF_LS + comp * 6;
+        float y0 = _Packed[mo + 0] + exp(_Packed[lo_ + 0]) * Normal(s);
+        float y1 = _Packed[mo + 1] + exp(_Packed[lo_ + 1]) * Normal(s);
+        float y2 = _Packed[mo + 2] + exp(_Packed[lo_ + 2]) * Normal(s);
+        float y3 = _Packed[mo + 3] + exp(_Packed[lo_ + 3]) * Normal(s);
+        float y4 = _Packed[mo + 4] + exp(_Packed[lo_ + 4]) * Normal(s);
+        float y5 = _Packed[mo + 5] + exp(_Packed[lo_ + 5]) * Normal(s);
+        float u2 = NextU(s); acc = 0; int kb = 0;
+        for (int q3 = 0; q3 < NBINS; q3++) { acc += ps[q3]; if (u2 > acc) kb++; }
+        kb = min(kb, NBINS - 1);
+        int klo = _SizeEdges[kb], khi = _SizeEdges[kb + 1];
+        int k = klo + (int)floor(NextU(s) * (khi - klo));
+        float3 c = P + (y0 * e1 + y1 * _Upv + y2 * e2) * _Rc;
+        float3 uv = V + (y3 * e1 + y4 * _Upv + y5 * e2) + _Launch * nh;
+        uint slot;
+        InterlockedAdd(_EventCount[0], 1u, slot);
+        InterlockedAdd(_Stats[0], 1u);
+        if ((int)slot >= _MaxEvents) { InterlockedAdd(_Stats[1], 1u); continue; }
+        Event ev; ev.c = float4(c, 0.0); ev.u = float4(uv, 0.0); ev.meta = uint4((uint)i, (uint)k, (uint)comp | ((uint)kb << 8), _Round);
+        _Events[slot] = ev;
+    }
+}
+
+[numthreads(1, 1, 1)]
+void EventArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint n = min(_EventCount[0], (uint)_MaxEvents);
+    _Args[0] = min(n, 65535u); _Args[1] = 1u; _Args[2] = 1u;
+}
+
+// ---------------------------------------------------------------- births phase 2: one group per event -> droplets
+groupshared int gsBase;
+
+[numthreads(64, 1, 1)]
+void Spawn(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    Event ev = _Events[gid.x];
+    int k = (int)ev.meta.y;
+    if (gi == 0)
+    {
+        // exact cap semantics (an event that does not fit is dropped whole): CAS reservation
+        uint cur = _CountOut[0];
+        int base = -1;
+        [loop] for (uint t = 0; t < 4096; t++)
+        {
+            if (cur + (uint)k > (uint)_MaxDrops) break;
+            uint prev;
+            InterlockedCompareExchange(_CountOut[0], cur, cur + (uint)k, prev);
+            if (prev == cur) { base = (int)cur; break; }
+            cur = prev;
+        }
+        gsBase = base;
+        if (base < 0) InterlockedAdd(_Stats[3], (uint)k); else InterlockedAdd(_Stats[2], (uint)k);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    int base2 = gsBase;
+    if (base2 < 0) return;
+    float sp = 2.0 * _Rd, jit = 0.1 * _Rd;
+    float3 mean = _LatCum[k].xyz / k;
+    for (int m = (int)gi; m < k; m += 64)
+    {
+        uint s = Hash(_Seed ^ 0xA511E9B3u ^ Hash(_Step * 0x9E3779B9u ^ Hash(gid.x * 0x85EBCA6Bu ^ Hash((uint)m + 0x165667B1u))));
+        float3 p = ev.c.xyz + (_Lat[m].xyz - mean) * sp + jit * float3(Normal(s), Normal(s), Normal(s));
+        float3 v = ev.u.xyz + _SigIn * float3(Normal(s), Normal(s), Normal(s));
+        Droplet d; d.xa = float4(p, 0.0); d.v = v; d.id = 0u;
+        _PoolOut[base2 + m] = d;
+    }
+}
+
+[numthreads(1, 1, 1)]
+void DropArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint n = _CountIn[0];
+    _Args[0] = max((n + 63u) / 64u, 1u); _Args[1] = 1u; _Args[2] = 1u;
+}
+
+// ---------------------------------------------------------------- raster (every rendered frame)
+int _RW, _RH;
+float3 _Eye, _Right, _Up, _Fwd;
+float _Focal, _Aspect, _MinRpx, _RScale, _TScale;
+int _FieldMode;
+RWStructuredBuffer<uint> _ZKey;        // texture layout (row 0 = bottom)
+RWStructuredBuffer<uint> _ZChord;      // float bits (atomic sums)
+RWStructuredBuffer<uint> _ZSpeed;      // float bits (max of non-negative floats)
+RWStructuredBuffer<float4> _ZNrm;
+RWStructuredBuffer<float4> _Field;     // the bulk field (texture layout): depth test, and Field-mode merge target
+RWTexture2D<float4> _SprayField;       // Overlay: (front, chord x scale, 1, speed), 0 = none
+RWTexture2D<float4> _SprayNrm;         // Overlay: analytic normal (view space), w = 1
+
+[numthreads(64, 1, 1)]
+void RClear(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _RW * _RH) return;
+    _ZKey[id.x] = 0xFFFFFFFFu; _ZChord[id.x] = 0u; _ZSpeed[id.x] = 0u;
+}
+
+// shared footprint walk; mode 0 = depth / chord / speed, mode 1 = normal of the winner
+void Footprint(uint idx, int mode)
+{
+    if (idx >= _CountIn[0]) return;
+    Droplet d = _PoolIn[idx];
+    if (d.xa.w < 1.0) return;                                  // newborns: not advanced yet
+    // `precise`: no FMA contraction, so the float ops round as the C# reference's do (gate P5)
+    precise float halfH = 0.5 * _RH, pxPerUnit = _Focal * halfH;
+    precise float rW = _Rd * max(_RScale, 1e-3);
+    precise float3 rel = d.xa.xyz - _Eye;
+    precise float cx = rel.x * _Right.x + rel.y * _Right.y + rel.z * _Right.z;
+    precise float cy = rel.x * _Up.x + rel.y * _Up.y + rel.z * _Up.z;
+    precise float depth = rel.x * _Fwd.x + rel.y * _Fwd.y + rel.z * _Fwd.z;
+    if (!(depth > 1e-2)) return;
+    precise float pxf = (_Focal * cx / depth / _Aspect + 1.0) * 0.5 * _RW;
+    precise float pyf = (1.0 - _Focal * cy / depth) * 0.5 * _RH;
+    precise float rTrue = rW * pxPerUnit / depth;
+    precise float rPix = max(rTrue, _MinRpx);
+    precise float rEff = rPix * depth / pxPerUnit;
+    if (!(pxf + rPix > 0 && pxf - rPix < _RW && pyf + rPix > 0 && pyf - rPix < _RH)) return;
+    int S = (int)ceil(rPix);
+    int x0 = (int)floor(pxf), y0 = (int)floor(pyf);
+    precise float r2 = rPix * rPix, rE2 = rEff * rEff, dScale = depth / pxPerUnit;
+    float spd = length(d.v);
+    for (int oy = -S; oy <= S; oy++)
+    {
+        int ty = y0 + oy; if (ty < 0 || ty >= _RH) continue;
+        precise float dy = ty + 0.5 - pyf;
+        for (int ox = -S; ox <= S; ox++)
+        {
+            int tx = x0 + ox; if (tx < 0 || tx >= _RW) continue;
+            precise float dx = tx + 0.5 - pxf;
+            precise float rho2 = dx * dx + dy * dy;
+            if (!(rho2 < r2)) continue;
+            precise float s2 = rho2 * dScale * dScale;
+            precise float hh = sqrt(max(rE2 - s2, 0.0));
+            precise float front = depth - hh;
+            int ti = (_RH - 1 - ty) * _RW + tx;
+            float4 f = _Field[ti];
+            if (f.z >= 0.5 && front >= f.x) continue;          // behind / inside the predicted bulk
+            if (mode == 0)
+            {
+                InterlockedMin(_ZKey[ti], FloatToKey(front));
+                ATOMIC_ADD_F(_ZChord, ti, 2.0 * hh);
+                InterlockedMax(_ZSpeed[ti], asuint(spd));
+            }
+            else if (FloatToKey(front) == _ZKey[ti])
+            {
+                float inv = 1.0 / max(rEff, 1e-9);
+                _ZNrm[ti] = float4(dx * dScale * inv, -dy * dScale * inv, hh * inv, 1.0);
+            }
+        }
+    }
+}
+
+[numthreads(64, 1, 1)]
+void RDepth(uint3 id : SV_DispatchThreadID) { Footprint(id.x, 0); }
+
+[numthreads(64, 1, 1)]
+void RNormal(uint3 id : SV_DispatchThreadID) { Footprint(id.x, 1); }
+
+[numthreads(8, 8, 1)]
+void RResolve(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _RW || (int)id.y >= _RH) return;
+    int ti = (int)id.y * _RW + (int)id.x;                      // texture layout: RT row y = buffer row y
+    uint key = _ZKey[ti];
+    bool hit = key != 0xFFFFFFFFu;
+    if (_FieldMode != 0)
+    {
+        if (!hit) return;
+        float4 f = _Field[ti];
+        float thick = (f.z >= 0.5 ? f.y : 0.0) + asfloat(_ZChord[ti]) * _TScale;
+        _Field[ti] = float4(KeyToFloat(key), thick, 1.0, max(f.z >= 0.5 ? f.w : 0.0, asfloat(_ZSpeed[ti])));
+        return;
+    }
+    _SprayField[id.xy] = hit ? float4(KeyToFloat(key), asfloat(_ZChord[ti]) * _TScale, 1.0, asfloat(_ZSpeed[ti])) : float4(0, 0, 0, 0);
+    _SprayNrm[id.xy] = hit ? _ZNrm[ti] : float4(0, 0, 0, 0);
+}

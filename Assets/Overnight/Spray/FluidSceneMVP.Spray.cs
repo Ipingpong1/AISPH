@@ -287,6 +287,7 @@ public partial class FluidSceneMVP
     string SprayStatus()
     {
         if (!sprayEnabled) return "";
+        if (gpuSprayLayer != null) return GpuSprayStatus();   // GPU1001: the GPU layer is running instead
         if (spray == null) return sprayError != null ? $"   SPRAY ERROR: {sprayError}" : "   SPRAY (starting)";
         return $"   SPRAY {spray.Visible} drops +{spray.LastBorn} ({spray.LastEvents} ev, Σλ {spray.LastRateSum:F1}" +
                $"{(spray.LastDropped > 0 ? $", capped {spray.LastDropped}" : "")})  " +
