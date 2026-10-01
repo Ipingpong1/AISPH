@@ -13,11 +13,12 @@ using UnityEngine;
 
 public class GpuPortBench : MonoBehaviour
 {
-    public struct Config { public string name; public bool gpu, spray, foam; }
+    [Serializable] public struct Config { public string name; public bool gpu, spray, foam; }
 
     public string outPath = "";
     public float warmupSec = 2f, measureSec = 5f;
     public int rounds = 2;
+    public bool resetEachWindow = true;   // every window replays the same drop from t = 0
     public Config[] configs;
     public bool Done { get; private set; }
 
@@ -45,6 +46,7 @@ public class GpuPortBench : MonoBehaviour
                 if (f.GpuPathEnabled != c.gpu) f.ToggleGpuPath();
                 if (f.SprayEnabled != c.spray) f.ToggleSpray();
                 if (f.FoamEnabled != c.foam) f.ToggleFoam();
+                if (resetEachWindow) f.ResetSim();
                 float t0 = Time.realtimeSinceStartup;
                 while (Time.realtimeSinceStartup - t0 < warmupSec) yield return null;
                 if (!res.TryGetValue(c.name, out var a)) res[c.name] = a = new Acc();

@@ -115,10 +115,24 @@ public partial class FluidSceneMVP
             int knnSetDiff = 0, knnOrderDiff = 0, nonTie = 0; double tieWorst = 0;
             int nbBadRows = 0; double nbMax = 0;
             var setA = new HashSet<int>();
+            var ownCols = new int[12]; var ownEx = new StringBuilder();
             for (int i = 0; i < n; i++)
             {
                 bool bad = false;
-                for (int c = 0; c < 12; c++) { double d = Math.Abs(Xc[i * 124 + c] - fd.X[i * 124 + c]); ownMax = Math.Max(ownMax, d); if (d > 1e-4) bad = true; }
+                for (int c = 0; c < 12; c++)
+                {
+                    double d = Math.Abs(Xc[i * 124 + c] - fd.X[i * 124 + c]); ownMax = Math.Max(ownMax, d);
+                    if (d > 1e-4)
+                    {
+                        bad = true; ownCols[c]++;
+                        if (ownEx.Length < 600)
+                        {
+                            int b0 = off + 7 * i;
+                            double vx = rec[b0 + 3], vy = rec[b0 + 4], vz = rec[b0 + 5];
+                            ownEx.Append($"row {i} col {c}: cpu {Xc[i * 124 + c].ToString("G6", inv)} gpu {fd.X[i * 124 + c].ToString("G6", inv)} |v| {Math.Sqrt(vx * vx + vy * vy + vz * vz).ToString("G3", inv)} |v_h| {Math.Sqrt(vx * vx + vz * vz).ToString("G3", inv)}; ");
+                        }
+                    }
+                }
                 if (bad) ownBadRows++;
                 bool orderSame = true;
                 setA.Clear();
@@ -151,7 +165,7 @@ public partial class FluidSceneMVP
             sb.Append($",\"P1\":{{\"pass\":{(p1 ? "true" : "false")},\"nfull_cpu\":{L.NFull.ToString("R", inv)},\"nfull_gpu\":{fd.NFull.ToString("R", inv)}," +
                       $"\"minh_abs\":{minhD.ToString("G4", inv)},\"own_max_abs\":{ownMax.ToString("G4", inv)},\"own_rows_over_1e-4\":{ownBadRows}," +
                       $"\"knn_set_diff_rows\":{knnSetDiff},\"knn_order_diff_rows\":{knnOrderDiff},\"knn_nontie_slots\":{nonTie},\"knn_tie_worst_rc\":{tieWorst.ToString("G4", inv)}," +
-                      $"\"nb_max_abs\":{nbMax.ToString("G4", inv)},\"nb_rows_over_1e-4\":{nbBadRows}}}");
+                      $"\"nb_max_abs\":{nbMax.ToString("G4", inv)},\"nb_rows_over_1e-4\":{nbBadRows},\"own_cols_over_1e-4\":[{string.Join(",", ownCols)}],\"own_examples\":\"{ownEx}\"}}");
 
             // ---------------- P2 MLP on the C# rows
             L.RunMlp();
@@ -262,6 +276,8 @@ public partial class FluidSceneMVP
             var cF = new Color[HW]; var cN = new Color[HW];
             L3.CompositeOverlay(bulk, cF, W, H, eyeSim, rightSim, upSim, fwdSim, focalM, winAspect, ts, sprayMinRadiusPx, sprayRadiusScale, cN);
             int drawnC = 0, drawnG = 0, drawnDiff = 0; double fMax = 0, tMax = 0, nMax = 0;
+            int badPx = 0; double badRelChordMax = 0, goodRelChordMin = 1e9;
+            float fullChord = 2f * L3.RD * sprayRadiusScale * ts;   // chord through the centre of one droplet (x thickness scale)
             for (int i = 0; i < HW; i++)
             {
                 bool a = cF[i].b > 0f, b = gF[i].z > 0f;
@@ -271,10 +287,14 @@ public partial class FluidSceneMVP
                 fMax = Math.Max(fMax, Math.Abs(cF[i].r - gF[i].x));
                 tMax = Math.Max(tMax, Math.Abs(cF[i].g - gF[i].y));
                 nMax = Math.Max(nMax, Math.Max(Math.Abs(cN[i].r - gN[i].x), Math.Max(Math.Abs(cN[i].g - gN[i].y), Math.Abs(cN[i].b - gN[i].z))));
+                bool pxBad = Math.Abs(cF[i].r - gF[i].x) > 1e-5 || Math.Abs(cF[i].g - gF[i].y) > 1e-4;
+                double relChord = cF[i].g / Math.Max(fullChord, 1e-12);   // ~ 2 hh / (2 r) for a single droplet: 0 at the rim
+                if (pxBad) { badPx++; badRelChordMax = Math.Max(badRelChordMax, relChord); }
             }
             bool p5 = drawnDiff <= 0.001 * Math.Max(drawnC, 1) && fMax <= 1e-5 && tMax <= 1e-4 && nMax <= 1e-3;
             sb.Append($",\"P5\":{{\"pass\":{(p5 ? "true" : "false")},\"droplets\":{m5},\"drawn_cpu\":{drawnC},\"drawn_gpu\":{drawnG},\"drawn_diff\":{drawnDiff}," +
-                      $"\"front_max_m\":{fMax.ToString("G4", inv)},\"chord_max\":{tMax.ToString("G4", inv)},\"normal_max\":{nMax.ToString("G4", inv)}}}");
+                      $"\"front_max_m\":{fMax.ToString("G4", inv)},\"chord_max\":{tMax.ToString("G4", inv)},\"normal_max\":{nMax.ToString("G4", inv)}," +
+                      $"\"px_over_tol\":{badPx},\"over_tol_max_chord_over_full\":{badRelChordMax.ToString("G4", inv)}}}");
             L2.Dispose(); L3.Dispose();
         }
         finally

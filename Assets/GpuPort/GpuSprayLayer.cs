@@ -220,6 +220,23 @@ public sealed class GpuSprayLayer : IDisposable
     void B(CommandBuffer cb, int k, string name, ComputeBuffer b) => cb.SetComputeBufferParam(cs, k, name, b);
     static int G64(int n) => Math.Max((n + 63) / 64, 1);
 
+    // per-stage GPU timing (ms, summed over the steps of the last frame; profiler Recorders)
+    UnityEngine.Profiling.CustomSampler sGrid, sAdvance, sFeat, sMlp, sBirths, sRaster;
+    UnityEngine.Profiling.Recorder rGrid, rAdvance, rFeat, rMlp, rBirths, rRaster;
+    void EnsureSamplers()
+    {
+        if (sGrid != null) return;
+        UnityEngine.Profiling.CustomSampler S(string n, out UnityEngine.Profiling.Recorder r)
+        { var smp = UnityEngine.Profiling.CustomSampler.Create(n, true); r = smp.GetRecorder(); r.enabled = true; return smp; }
+        sGrid = S("GPU1001.Spray.Grid", out rGrid); sAdvance = S("GPU1001.Spray.Advance", out rAdvance);
+        sFeat = S("GPU1001.Spray.Features", out rFeat); sMlp = S("GPU1001.Spray.MLP", out rMlp);
+        sBirths = S("GPU1001.Spray.Births", out rBirths); sRaster = S("GPU1001.Spray.Raster", out rRaster);
+    }
+    static float Ms(UnityEngine.Profiling.Recorder r) => r != null ? r.gpuElapsedNanoseconds * 1e-6f : 0f;
+    public string StageTimes() => $"grid {Ms(rGrid):F2} adv {Ms(rAdvance):F2} feat {Ms(rFeat):F2} mlp {Ms(rMlp):F2} birth {Ms(rBirths):F2} raster {Ms(rRaster):F2}";
+    public float MsGrid => Ms(rGrid); public float MsAdvance => Ms(rAdvance); public float MsFeat => Ms(rFeat);
+    public float MsMlp => Ms(rMlp); public float MsBirths => Ms(rBirths); public float MsRaster => Ms(rRaster);
+
     // ------------------------------------------------------------------ one solver frame
     /// <summary>Grid, flight + culls, features, MLP, births for the coarse state in (pos, vel) — recorded, not executed.</summary>
     public void RecordStep(CommandBuffer cb, GraphicsBuffer pos, GraphicsBuffer vel, int n, float rc, bool withBirths = true)
@@ -229,14 +246,25 @@ public sealed class GpuSprayLayer : IDisposable
         EnsureCapacity(n);
         EnsureInput(n);
         SetParams(cb, n, rc);
+        EnsureSamplers();
+        cb.BeginSample(sGrid);
         RecordReset(cb, countB);
         RecordGrid(cb, pos, n);
+        cb.EndSample(sGrid);
+        cb.BeginSample(sAdvance);
         RecordAdvance(cb, pos, poolA, countA, poolB, countB);
+        cb.EndSample(sAdvance);
         if (n > 0)
         {
+            cb.BeginSample(sFeat);
             RecordFeatures(cb, pos, vel, n);
+            cb.EndSample(sFeat);
+            cb.BeginSample(sMlp);
             var packed = RecordMlp(cb);
+            cb.EndSample(sMlp);
+            cb.BeginSample(sBirths);
             if (withBirths) RecordBirths(cb, pos, vel, n, packed, poolB, countB);
+            cb.EndSample(sBirths);
         }
         (poolA, poolB) = (poolB, poolA);
         (countA, countB) = (countB, countA);
@@ -299,9 +327,9 @@ public sealed class GpuSprayLayer : IDisposable
         cb.DispatchCompute(cs, kFeatHist, G64(n), 1, 1);
         B(cb, kFeatPct, "_Hist", hist); B(cb, kFeatPct, "_ScalarF", scalarF); B(cb, kFeatPct, "_ScalarU", scalarU);
         cb.DispatchCompute(cs, kFeatPct, 1, 1, 1);
-        B(cb, kFeatB, "_ScalarF", scalarF); B(cb, kFeatB, "_PosIn", pos); B(cb, kFeatB, "_VelIn", vel); B(cb, kFeatB, "_NHat", nhat);
-        B(cb, kFeatB, "_Cnt", cnt); B(cb, kFeatB, "_CellStart", cellStart); B(cb, kFeatB, "_Sorted", sorted); B(cb, kFeatB, "_E1", e1);
-        B(cb, kFeatB, "_E2", e2); B(cb, kFeatB, "_X", xBuf); B(cb, kFeatB, "_Knn", knn); B(cb, kFeatB, "_Ita", ita);
+        B(cb, kFeatB, "_ScalarFR", scalarF); B(cb, kFeatB, "_PosIn", pos); B(cb, kFeatB, "_VelIn", vel); B(cb, kFeatB, "_NHatR", nhat);
+        B(cb, kFeatB, "_CntR", cnt); B(cb, kFeatB, "_CellStartR", cellStart); B(cb, kFeatB, "_SortedR", sorted); B(cb, kFeatB, "_E1", e1);
+        B(cb, kFeatB, "_E2", e2); B(cb, kFeatB, "_X", xBuf); B(cb, kFeatB, "_KnnR", knn); B(cb, kFeatB, "_ItaR", ita);
         cb.DispatchCompute(cs, kFeatB, G64(n), 1, 1);
     }
 
@@ -346,6 +374,8 @@ public sealed class GpuSprayLayer : IDisposable
     {
         EnsureRaster(W, H);
         if (poolA == null) EnsureCapacity(1);
+        EnsureSamplers();
+        cb.BeginSample(sRaster);
         cb.SetComputeIntParam(cs, "_RW", W); cb.SetComputeIntParam(cs, "_RH", H);
         cb.SetComputeVectorParam(cs, "_Eye", eye); cb.SetComputeVectorParam(cs, "_Right", right);
         cb.SetComputeVectorParam(cs, "_Up", up); cb.SetComputeVectorParam(cs, "_Fwd", fwd);
@@ -368,6 +398,7 @@ public sealed class GpuSprayLayer : IDisposable
         cb.SetComputeTextureParam(cs, kRResolve, "_SprayField", SprayFieldRT);
         cb.SetComputeTextureParam(cs, kRResolve, "_SprayNrm", SprayNrmRT);
         cb.DispatchCompute(cs, kRResolve, (W + 7) / 8, (H + 7) / 8, 1);
+        cb.EndSample(sRaster);
     }
 
     // ------------------------------------------------------------------ parity hooks (P1-P5)

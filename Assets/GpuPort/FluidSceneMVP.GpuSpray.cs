@@ -185,6 +185,6 @@ public partial class FluidSceneMVP
         var L = gpuSprayLayer;
         return $"   GPU SPRAY {L.Alive} drops +{L.LastBorn} ({L.LastEvents} ev, Σλ {L.LastRateSum:F1}" +
                $"{(L.LastDropped > 0 ? $", capped {L.LastDropped}" : "")}{(L.LastEventOverflow > 0 ? $", ev overflow {L.LastEventOverflow}" : "")}) " +
-               $"gpu {GpuMsSpray:F2} ms ({sprayRenderMode})";
+               $"gpu {GpuMsSpray:F2} ms [{L.StageTimes()}] ({sprayRenderMode})";
     }
 }

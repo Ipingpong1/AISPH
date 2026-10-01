@@ -123,6 +123,15 @@ RWStructuredBuffer<uint> _ScalarU;     // [0] min-height key
 RWStructuredBuffer<float> _ScalarF;    // [0] n_full, [1] min height
 RWStructuredBuffer<float> _X;          // [nPad, 124] — the MLP input tensor
 StructuredBuffer<float> _Packed;       // [nPad, 63] — the MLP output tensor
+// read-only views of the buffers above (bound to the same GraphicsBuffers): FeatB would otherwise need 10 UAVs, above
+// the portable limit of 8 (Unity warning; it ran on Vulkan, gate P1 passed, but other APIs would not bind it)
+StructuredBuffer<uint> _CellStartR;
+StructuredBuffer<uint> _SortedR;
+StructuredBuffer<uint> _CntR;
+StructuredBuffer<float> _ItaR;
+StructuredBuffer<float4> _NHatR;
+StructuredBuffer<int> _KnnR;
+StructuredBuffer<float> _ScalarFR;
 
 // integers live in uint fields: an int stored as asfloat() bits is a denormal, and the GPU flushes those to 0 (found by
 // gate P3: every event's parent read back as 0)
@@ -375,13 +384,13 @@ void FeatB(uint3 id : SV_DispatchThreadID)
     int i = (int)id.x;
     if (i >= _N) return;
     float h = _H, h2 = h * h;
-    float nFull = _ScalarF[0], minH = _ScalarF[1];
+    float nFull = _ScalarFR[0], minH = _ScalarFR[1];
     float surfCut = 0.75 * nFull;
     float3 pi_ = _PosIn[i], vi_ = _VelIn[i];
-    float3 ni = _NHat[i].xyz;
+    float3 ni = _NHatR[i].xyz;
     float vm = length(vi_), vmd = max(vm, 1e-9);
     float vdn = dot(vi_ / vmd, ni);
-    bool surfI = (float)_Cnt[i] < surfCut;
+    bool surfI = (float)_CntR[i] < surfCut;
     float wc = 0;
     if (surfI && vdn >= 0.6)
     {
@@ -393,16 +402,16 @@ void FeatB(uint3 id : SV_DispatchThreadID)
             int3 c = cc + int3(dx, dy, dz);
             if (any(c < 0) || any(c >= _Gn)) continue;
             int ci = CellIndex(c);
-            for (uint s = _CellStart[ci], e = _CellStart[ci + 1]; s < e; s++)
+            for (uint s = _CellStartR[ci], e = _CellStartR[ci + 1]; s < e; s++)
             {
-                int j = (int)_Sorted[s];
-                if (j == i || !((float)_Cnt[j] < surfCut)) continue;
+                int j = (int)_SortedR[s];
+                if (j == i || !((float)_CntR[j] < surfCut)) continue;
                 float3 xx = pi_ - _PosIn[j];
                 float d2 = dot(xx, xx);
                 if (d2 > h2) continue;
                 float d = max(sqrt(d2), 1e-9);
                 if (dot(xx / d, ni) <= 0) continue;
-                wc += (1.0 - dot(ni, _NHat[j].xyz)) * (1.0 - d / h);
+                wc += (1.0 - dot(ni, _NHatR[j].xyz)) * (1.0 - d / h);
             }
         }
     }
@@ -420,10 +429,10 @@ void FeatB(uint3 id : SV_DispatchThreadID)
     _X[r + 0] = dot(vi_, a);
     _X[r + 1] = vu;
     _X[r + 2] = hgt;
-    _X[r + 3] = Log1pF(_Ita[i]);
+    _X[r + 3] = Log1pF(_ItaR[i]);
     _X[r + 4] = Log1pF(wc);
     _X[r + 5] = Log1pF(ek);
-    _X[r + 6] = _Cnt[i] / nFull;
+    _X[r + 6] = _CntR[i] / nFull;
     _X[r + 7] = surfI ? 1.0 : 0.0;
     _X[r + 8] = dot(vi_, ni) / vmd;
     _X[r + 9] = dot(ni, a);
@@ -431,7 +440,7 @@ void FeatB(uint3 id : SV_DispatchThreadID)
     _X[r + 11] = dot(ni, b);
     for (int k = 0; k < KNN; k++)
     {
-        int o = r + 12 + 7 * k, j = _Knn[i * KNN + k];
+        int o = r + 12 + 7 * k, j = _KnnR[i * KNN + k];
         if (j < 0) { for (int q = 0; q < 7; q++) _X[o + q] = 0; continue; }
         float3 dxv = _PosIn[j] - pi_, wv = _VelIn[j] - vi_;
         _X[o + 0] = dot(dxv, a) / _Rc;
@@ -445,16 +454,30 @@ void FeatB(uint3 id : SV_DispatchThreadID)
 }
 
 // ---------------------------------------------------------------- births phase 1: events (spray4f.births, LOR knobs)
+groupshared float gsLam[64];
+
 [numthreads(64, 1, 1)]
-void Births(uint3 id : SV_DispatchThreadID)
+void Births(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
     int i = (int)id.x;
-    if (i >= _N) return;
     int r = i * NPACK;
-    float lam = exp(_Packed[r]) * _SR;
-    if (lam > _Cap) lam = _Cap;
-    if (!(lam > 0)) return;
-    ATOMIC_ADD_F(_Stats, 8, lam);
+    float lam = 0;
+    if (i < _N)
+    {
+        lam = exp(_Packed[r]) * _SR;
+        if (lam > _Cap) lam = _Cap;
+        if (!(lam > 0)) lam = 0;
+    }
+    // sum of lambda: one atomic per group (a CAS float add from every particle on one address serialised ~3 ms)
+    gsLam[gi] = lam;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint sh = 32; sh > 0; sh >>= 1)
+    {
+        if (gi < sh) gsLam[gi] += gsLam[gi + sh];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0 && gsLam[0] > 0) ATOMIC_ADD_F(_Stats, 8, gsLam[0]);
+    if (i >= _N || !(lam > 0)) return;
     uint s = Hash(_Seed ^ Hash(_Step * 0x9E3779B9u ^ Hash(_Round * 0x85EBCA6Bu ^ Hash((uint)i + 0x27D4EB2Fu))));
     int ne = Poisson(lam, s);
     if (ne == 0) return;
