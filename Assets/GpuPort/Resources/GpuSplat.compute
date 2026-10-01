@@ -1,0 +1,256 @@
+// GpuSplat.compute — GPU1001 (2026-10-01): SplatV2 (Assets/SplatV2.cs) + the network-input normalisation of
+// FluidSceneMVP.SplatToInput + the decode loop of FluidSceneMVP.ProcessPrediction, on the GPU. The particles come
+// straight from GpuSphSolver's buffers and the prediction straight from the Inference Engine output tensor, so
+// nothing crosses to the CPU. Same float math as the C# reference, op for op where the order is defined; the
+// accumulations are atomic float adds (CAS), so their summation order — and the last bits — vary run to run.
+// Gate S1/S2: SSU_restart/Experiments/GPU1001/PLAN.md.
+//
+// Image buffers are in TENSOR layout (row 0 = top, index = row * W + col) except _Field, which is in TEXTURE layout
+// (row 0 = bottom) like FluidSceneMVP.px, so a CPU fallback can GetData it straight into a Color[].
+#pragma kernel Clear
+#pragma kernel Splat
+#pragma kernel Pack
+#pragma kernel Decode
+#pragma kernel FieldToTex
+#pragma kernel FgStats
+
+#define GROUPS_X 1024        // Splat: one 64-thread group per particle, groups laid out GROUPS_X wide
+#define DEPTH_SENTINEL 1e6
+
+uint FloatToKey(float f) { uint u = asuint(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
+float KeyToFloat(uint k) { return asfloat((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k); }
+
+// atomic float add on a uint buffer (compare-and-swap loop)
+#define ATOMIC_ADD_F(buf, idx, val)                                                   \
+{                                                                                   \
+    uint _o = buf[idx];                                                             \
+    [loop] for (uint _t = 0; _t < 4096; _t++)                                       \
+    {                                                                               \
+        uint _p;                                                                    \
+        InterlockedCompareExchange(buf[idx], _o, asuint(asfloat(_o) + (val)), _p);  \
+        if (_p == _o) break;                                                        \
+        _o = _p;                                                                    \
+    }                                                                               \
+}
+
+int _N, _H, _W;
+float3 _Eye, _Right, _Up, _Fwd;
+float _Focal, _WorldR, _ThickScaleV2, _MinR, _MaxR;
+
+StructuredBuffer<float3> _PosIn;
+StructuredBuffer<float3> _VelIn;
+StructuredBuffer<float> _DensIn;
+
+// accumulators (tensor layout)
+RWStructuredBuffer<uint> _DepthKey;      // order-preserving key of the min front depth; key(1e6) = empty
+RWStructuredBuffer<uint> _Thick;         // float bits, atomic sums
+RWStructuredBuffer<uint> _VelX;
+RWStructuredBuffer<uint> _VelY;
+RWStructuredBuffer<uint> _VelZ;
+RWStructuredBuffer<uint> _Den;
+
+[numthreads(64, 1, 1)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _H * _W) return;
+    _DepthKey[id.x] = FloatToKey(DEPTH_SENTINEL);
+    _Thick[id.x] = 0u; _VelX[id.x] = 0u; _VelY[id.x] = 0u; _VelZ[id.x] = 0u; _Den[id.x] = 0u;
+}
+
+groupshared float gsK[64];
+
+// One 64-thread group per particle. Every thread recomputes the (cheap) projection; the per-particle kernel sum over
+// the WHOLE footprint (off-image pixels included) is a group reduction; then the threads stride over the stamp.
+[numthreads(64, 1, 1)]
+void Splat(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    int pi = (int)(gid.y * GROUPS_X + gid.x);
+    if (pi >= _N) return;                                    // uniform per group
+
+    float aspect = (float)_W / _H;
+    float halfH = _H * 0.5f;
+    float pxPerUnit = _Focal * halfH;
+    float rw2 = _WorldR * _WorldR;
+    float volK = _ThickScaleV2 * (4.0f / 3.0f) * 3.14159265358979f * _WorldR;
+
+    float3 p = _PosIn[pi];
+    float rx = p.x - _Eye.x, ry = p.y - _Eye.y, rz = p.z - _Eye.z;
+    float cx = rx * _Right.x + ry * _Right.y + rz * _Right.z;
+    float cy = rx * _Up.x + ry * _Up.y + rz * _Up.z;
+    float cz = -(rx * _Fwd.x + ry * _Fwd.y + rz * _Fwd.z);
+    float depth = -cz;
+    if (!(depth > 1e-3f)) return;
+
+    float pxf = (_Focal * cx / depth / aspect + 1.0f) * 0.5f * _W;
+    float pyf = (1.0f - _Focal * cy / depth) * 0.5f * _H;
+    float rTrue = _WorldR * _Focal * halfH / depth;
+    float r = rTrue < _MinR ? _MinR : (rTrue > _MaxR ? _MaxR : rTrue);
+    if (!(pxf + r > 0.0f && pxf - r < _W && pyf + r > 0.0f && pyf - r < _H)) return;
+
+    float T = volK * rTrue * rTrue;
+    int S = (int)ceil(r);
+    int x0 = (int)floor(pxf), y0 = (int)floor(pyf);
+    float r2 = r * r;
+    int side = 2 * S + 1, cells = side * side;
+
+    // pass 1: kernel sum
+    float ks = 0.0f;
+    for (int c = (int)gi; c < cells; c += 64)
+    {
+        int oy = c / side - S, ox = c % side - S;
+        float dy = (y0 + oy) + 0.5f - pyf;
+        float dx = (x0 + ox) + 0.5f - pxf;
+        float rho2 = dx * dx + dy * dy;
+        if (rho2 < r2) { float u = 1.0f - rho2 / r2; ks += sqrt(u > 0.0f ? u : 0.0f); }
+    }
+    gsK[gi] = ks;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 32; s > 0; s >>= 1)
+    {
+        if (gi < s) gsK[gi] += gsK[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float kSum = gsK[0];
+    if (!(kSum > 1e-12f)) return;
+
+    float3 v = _VelIn[pi];
+    float dn = _DensIn[pi];
+    float vcx = v.x * _Right.x + v.y * _Right.y + v.z * _Right.z;
+    float vcy = v.x * _Up.x + v.y * _Up.y + v.z * _Up.z;
+    float vcz = -(v.x * _Fwd.x + v.y * _Fwd.y + v.z * _Fwd.z);
+    float dScale = depth / pxPerUnit;
+    float dScale2 = dScale * dScale;
+
+    // pass 2: deposit
+    for (int c2 = (int)gi; c2 < cells; c2 += 64)
+    {
+        int oy = c2 / side - S, ox = c2 % side - S;
+        int ty = y0 + oy, tx = x0 + ox;
+        float dy = ty + 0.5f - pyf;
+        float dx = tx + 0.5f - pxf;
+        float rho2 = dx * dx + dy * dy;
+        if (!(rho2 < r2)) continue;
+        if (tx < 0 || tx >= _W || ty < 0 || ty >= _H) continue;
+        float u = 1.0f - rho2 / r2;
+        float k = sqrt(u > 0.0f ? u : 0.0f);
+        float w = T * k / kSum;
+        uint i = (uint)(ty * _W + tx);
+        ATOMIC_ADD_F(_Thick, i, w);
+        float s2 = rho2 * dScale2;
+        float h2 = rw2 - s2;
+        float dPix = depth - sqrt(h2 > 0.0f ? h2 : 0.0f);
+        InterlockedMin(_DepthKey[i], FloatToKey(dPix));
+        ATOMIC_ADD_F(_VelX, i, vcx * w);
+        ATOMIC_ADD_F(_VelY, i, vcy * w);
+        ATOMIC_ADD_F(_VelZ, i, vcz * w);
+        ATOMIC_ADD_F(_Den, i, dn * w);
+    }
+}
+
+// ---------------------------------------------------------------- normalised network input (SplatToInput, V2)
+float4 _Mean0123, _Mean45;               // meta.mean[0..5]
+float4 _InvStd0123, _InvStd45;           // 1 / meta.std[0..5], computed in C# float as the reference does
+float _ThickScale;                       // FluidSceneMVP.thickScale (1 for V2)
+RWStructuredBuffer<float> _In7;          // [7, H, W] — the U-Net input tensor's buffer
+
+[numthreads(64, 1, 1)]
+void Pack(uint3 id : SV_DispatchThreadID)
+{
+    int HW = _H * _W;
+    int i = (int)id.x;
+    if (i >= HW) return;
+    float t = asfloat(_Thick[i]);
+    float inv = t > 0.0f ? 1.0f / t : 0.0f;
+    float mask = t > 0.0f ? 1.0f : 0.0f;
+    float d = mask > 0.0f ? KeyToFloat(_DepthKey[i]) : 0.0f;
+    _In7[i] = (d - _Mean0123.x) * _InvStd0123.x;
+    _In7[HW + i] = (t * _ThickScale - _Mean0123.y) * _InvStd0123.y;
+    _In7[2 * HW + i] = (asfloat(_VelX[i]) * inv - _Mean0123.z) * _InvStd0123.z;
+    _In7[3 * HW + i] = (asfloat(_VelY[i]) * inv - _Mean0123.w) * _InvStd0123.w;
+    _In7[4 * HW + i] = (asfloat(_VelZ[i]) * inv - _Mean45.x) * _InvStd45.x;
+    _In7[5 * HW + i] = (asfloat(_Den[i]) * inv - _Mean45.y) * _InvStd45.y;
+    _In7[6 * HW + i] = mask;
+}
+
+// ---------------------------------------------------------------- decode (ProcessPrediction's per-pixel loop)
+float4 _Std0123, _Std45;                 // meta.std[0..5] (de-normalisation of the input velocity for the temporal speed)
+int _ShowRaw, _Temporal;
+StructuredBuffer<float> _Pred;           // [7, H, W] — the U-Net output tensor's buffer
+StructuredBuffer<float> _In7R;           // the input tensor (read-only view, for the temporal speed)
+RWStructuredBuffer<float4> _Field;       // TEXTURE layout: (depth, thickness, alpha, speed)
+RWStructuredBuffer<float> _FluidDepth;   // TENSOR layout: depth where alpha > 0 else 0 (foam's depth test)
+
+[numthreads(64, 1, 1)]
+void Decode(uint3 id : SV_DispatchThreadID)
+{
+    int HW = _H * _W;
+    int i = (int)id.x;
+    if (i >= HW) return;
+    int y = i / _W, x = i - y * _W;
+    int flipped = (_H - 1 - y) * _W + x;
+    float a, depth, thick;
+    if (_ShowRaw != 0)
+    {
+        float tr = asfloat(_Thick[i]);
+        a = tr > 1e-4f ? 1.0f : 0.0f;
+        thick = tr * _ThickScale;
+        depth = a > 0.0f ? KeyToFloat(_DepthKey[i]) : 0.0f;
+        if (a == 0.0f) thick = 0.0f;
+    }
+    else
+    {
+        a = _Pred[6 * HW + i] > 0.0f ? 1.0f : 0.0f;
+        depth = a > 0.0f ? _Pred[i] * _Std0123.x + _Mean0123.x : 0.0f;
+        thick = a > 0.0f ? max(_Pred[HW + i] * _Std0123.y + _Mean0123.y, 0.0f) : 0.0f;
+    }
+    float spd = 1.0f;
+    if (_Temporal != 0)
+    {
+        spd = 0.0f;
+        if (_In7R[6 * HW + i] > 0.0f)
+        {
+            float vx = _In7R[2 * HW + i] * _Std0123.z + _Mean0123.z;
+            float vy = _In7R[3 * HW + i] * _Std0123.w + _Mean0123.w;
+            float vz = _In7R[4 * HW + i] * _Std45.x + _Mean45.x;
+            spd = sqrt(vx * vx + vy * vy + vz * vz);
+        }
+    }
+    _Field[flipped] = float4(depth, thick, a, spd);
+    _FluidDepth[i] = a > 0.0f ? depth : 0.0f;
+}
+
+// _Field (texture layout) -> the field RT the smoothing / temporal / shading passes read
+StructuredBuffer<float4> _FieldR;
+RWTexture2D<float4> _FieldTex;
+
+[numthreads(8, 8, 1)]
+void FieldToTex(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _W || (int)id.y >= _H) return;
+    _FieldTex[id.xy] = _FieldR[id.y * _W + id.x];
+}
+
+// foreground depth sum / sum of squares / count per 256-pixel block (bilateral range sigma; summed on the CPU in
+// double after an async readback)
+RWStructuredBuffer<float4> _FgPartial;
+groupshared float3 gsFg[256];
+
+[numthreads(256, 1, 1)]
+void FgStats(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    int i = (int)(gid.x * 256 + gi);
+    float3 acc = 0;
+    if (i < _H * _W)
+    {
+        float4 f = _FieldR[i];
+        if (f.z > 0.0f) acc = float3(f.x, f.x * f.x, 1.0f);
+    }
+    gsFg[gi] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 128; s > 0; s >>= 1)
+    {
+        if (gi < s) gsFg[gi] += gsFg[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) _FgPartial[gid.x] = float4(gsFg[0], 0);
+}

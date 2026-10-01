@@ -768,6 +768,18 @@ public partial class FluidSceneMVP : MonoBehaviour
     void LateUpdate()   // after any camera controllers have moved the camera this frame
     {
         if (!ready) return;
+        lateSw.Restart();
+        LateUpdateInner();
+        lateSw.Stop();
+        LateUpdateMs = (float)lateSw.Elapsed.TotalMilliseconds;
+    }
+
+    readonly System.Diagnostics.Stopwatch lateSw = new System.Diagnostics.Stopwatch();
+    /// <summary>Main-thread wall-clock ms of the last LateUpdate (solver tick + splat + inference + shading setup).</summary>
+    public float LateUpdateMs { get; private set; }
+
+    void LateUpdateInner()
+    {
         float dt = capturing ? 1f / captureFps : Time.deltaTime;   // fixed step while capturing
 
         if (capturing)
@@ -788,6 +800,7 @@ public partial class FluidSceneMVP : MonoBehaviour
 
         ApplyPendingModelSwitch();   // overnight model bank (key K; Overnight/Models)
         if (ClassicalActive) { ClassicalLateUpdate(); return; }   // G3 classical C* surface instead of splat + network (key C; Overnight/Classical)
+        if (GpuPathActive) { GpuLateUpdate(); CaptureAndStatus(); return; }   // GPU1001: splat + decode (+ spray) on the GPU (key U; GpuPort/)
 
         int spread = ActiveSpread;
         if (spread > 0) StepSpreadInference(spread);
@@ -827,7 +840,17 @@ public partial class FluidSceneMVP : MonoBehaviour
                 kThickLocked = true;
         }
 
-        // Stage (depth, thickness, alpha) — prediction, or the raw model input when showRawInput.
+        FillFieldCpu(pred);
+        SprayComposite();   // G2 learned spray: droplets into the field before upload (no-op while off)
+        fieldTex.SetPixels(px);
+        fieldTex.Apply(false, false);
+        ShadeField(fieldTex);
+    }
+
+    // Stage (depth, thickness, alpha, speed) into px (texture rows) + foamFluidDepth + bilateralSigmaR, from the
+    // prediction, or the raw model input when showRawInput. (GPU1001: GpuSplat.compute Decode is its port; gate S2.)
+    void FillFieldCpu(float[] pred)
+    {
         float dm = meta.mean[0], ds = meta.std[0], tm = meta.mean[1], ts = meta.std[1];
         double dSum = 0.0, dSumSq = 0.0;
         int fgCount = 0;
@@ -872,14 +895,16 @@ public partial class FluidSceneMVP : MonoBehaviour
             double var = (dSumSq - dSum * dSum / fgCount) / (fgCount - 1);
             bilateralSigmaR = Mathf.Max(bilateralRangeScale * (float)Math.Sqrt(Math.Max(var, 0.0)), 1e-3f);
         }
-        SprayComposite();   // G2 learned spray: droplets into the field before upload (no-op while off)
-        fieldTex.SetPixels(px);
-        fieldTex.Apply(false, false);
+    }
 
+    // Everything downstream of the (depth, thickness, alpha, speed) field: smoothing, temporal, the 512² shading packs,
+    // the composite parameters and the foam layer. Shared by the CPU path (fieldTex) and the GPU1001 path (its field RT).
+    void ShadeField(Texture field)
+    {
         // smoothing chain (FluidSSFR pass 0, unchanged semantics)
         smoothMat.SetFloat("_BlurSigma", bilateralSmoothing ? bilateralSigmaS : presmoothSigma);
         smoothMat.SetFloat("_BilateralRangeSigma", bilateralSmoothing ? bilateralSigmaR : 0f);
-        Graphics.Blit(fieldTex, smoothedRT, smoothMat, 0);
+        Graphics.Blit(field, smoothedRT, smoothMat, 0);
         if (bilateralSmoothing)
             for (int it = 1; it < bilateralIters; it++)
             {
@@ -891,7 +916,7 @@ public partial class FluidSceneMVP : MonoBehaviour
         RenderTexture shadeSrc = smoothedRT;
         if (temporalMat != null)
         {
-            temporalMat.SetTexture("_FieldTex", fieldTex);
+            temporalMat.SetTexture("_FieldTex", field);
             temporalMat.SetTexture("_HistTex", histB);
             temporalMat.SetFloat("_HasHistory", hasHistory ? 1f : 0f);
             temporalMat.SetFloat("_Reproject", temporalReproject ? 1f : 0f);
@@ -1038,7 +1063,7 @@ public partial class FluidSceneMVP : MonoBehaviour
                  $"{(bilateralSmoothing ? "   BILATERAL" : "")}{(paused ? "   PAUSED" : "")}" +
                  $"{(capturing ? "   CAPTURING" : "")}" +
                  (foamEnabled ? $"   FOAM{(foamOnlyView ? " ONLY" : "")} {foam.Alive} ({foam.Spray}s/{foam.Foam}f/{foam.Bubble}b) " +
-                                $"+{foam.SpawnedTa}ta/{foam.SpawnedWc}wc  {foam.LastStepMs:F1}+{foam.LastSplatMs:F1} ms" : "") + SprayStatus() + ModelBankStatus();   // G2 learned spray; model bank (key K)
+                                $"+{foam.SpawnedTa}ta/{foam.SpawnedWc}wc  {foam.LastStepMs:F1}+{foam.LastSplatMs:F1} ms" : "") + SprayStatus() + ModelBankStatus() + GpuStatus();   // G2 learned spray; model bank (key K)
     }
 
     void SetShadeParams(Material m)
@@ -1116,6 +1141,7 @@ public partial class FluidSceneMVP : MonoBehaviour
             if (kb.cKey.wasPressedThisFrame) ToggleSurfaceSource();   // G3 classical C* surface
             if (kb.jKey.wasPressedThisFrame) ToggleSpray();   // G2 learned spray
             if (kb.kKey.wasPressedThisFrame) RequestModelCycle();   // overnight model bank (Overnight/Models; M/N are ObstacleSpawner's)
+            if (kb.uKey.wasPressedThisFrame) ToggleGpuPath();   // GPU1001 GPU splat / decode / spray
             if (kb.leftBracketKey.wasPressedThisFrame) playbackFps = Mathf.Max(1f, playbackFps - 5f);
             if (kb.rightBracketKey.wasPressedThisFrame) playbackFps += 5f;
 
@@ -1178,6 +1204,7 @@ public partial class FluidSceneMVP : MonoBehaviour
     void OnDestroy()
     {
         DisposeClassical();   // G3 classical C* surface
+        DisposeGpuPath();   // GPU1001
         SprayShutdown();   // G2 learned spray
         pendingInput?.Dispose();
         worker?.Dispose();
