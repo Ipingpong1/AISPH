@@ -1,0 +1,1134 @@
+// Dfsph.compute — DFSPH1001 (2026-10-01): SPlisHSPlasH c5a063d's DFSPH (TimeStepDFSPH, AVX + USE_PERFORMANCE_OPTIMIZATION
+// build, Real = float) with Bender et al. 2019 volume-map boundaries, on the GPU. Everything below mirrors the source line
+// by line; the plan, the reading notes and the gates are in SSU_restart/Experiments/DFSPH1001/PLAN.md. Order of one step
+// (DfsphSolver.RecordStep):
+//   GridClear/Count/Scan/Scatter/SortCells -> Neighbours (list + V_j gradW_ij with the AVX cubic, positions at step start)
+//   -> Boundary (computeVolumeAndBoundaryX: Vb, x_b, push-out) -> Density -> Factor
+//   -> DivInit, [PAccelV, DivUpdate, DivCheck] x K, PAccelV, DivFinal          (old dt)
+//   -> NonPressure (gravity + standard viscosity) -> CflReduce, CflFinal (new dt) -> IntegrateVel (old dt)
+//   -> PresInit, [PAccel, PresUpdate, PresCheck] x K, PAccel, PresFinal        (new dt)
+//   -> IntegratePos (old dt) -> EndStep (t += old dt, stats ring, old dt := new dt).
+// Iteration loops run on the GPU: each Check writes the indirect args of the next iteration (0 groups once SPlisHSPlasH's
+// loop condition is false), so the CPU records K >= the expected iterations and never reads back mid-step.
+// Kernels that use the support radius h: the fluid-fluid terms use CubicKernel_AVX (analytic), the boundary terms
+// sim->W / sim->gradW = PrecomputedKernel<CubicKernel, 10000> (table uploaded from C#, built with float math).
+#pragma kernel GridClear
+#pragma kernel GridCount
+#pragma kernel GridScan
+#pragma kernel GridScatter
+#pragma kernel GridSortCells
+#pragma kernel Neighbours
+#pragma kernel Boundary
+#pragma kernel Density
+#pragma kernel Factor
+#pragma kernel DivInit
+#pragma kernel PAccelV
+#pragma kernel DivUpdate
+#pragma kernel DivCheck
+#pragma kernel DivFinal
+#pragma kernel NonPressure
+#pragma kernel CflReduce
+#pragma kernel CflFinal
+#pragma kernel IntegrateVel
+#pragma kernel PresInit
+#pragma kernel PAccel
+#pragma kernel PresUpdate
+#pragma kernel PresCheck
+#pragma kernel PresFinal
+#pragma kernel IntegratePos
+#pragma kernel EndStep
+#pragma kernel VmSdf
+#pragma kernel VmVolume
+#pragma kernel ProbeKernels
+#pragma kernel ProbeBoundary
+
+#define T 128
+#define MAX_NBR 128
+#define MAX_BODIES 8
+#define SCAN_T 1024
+#define CHECK_T 256
+#define EPS 1.0e-5f
+#define RING 64
+
+// ---------------------------------------------------------------- state layout (_State, uint words)
+#define S_HOLD 0          // float: dt of the step being taken (TimeManager h at step start)
+#define S_HNEW 1          // float: dt from the CFL of this step (used by the pressure solve, then becomes S_HOLD)
+#define S_TIME 2          // float: simulation time (Real = float in the reference too)
+#define S_STEP 3          // uint: steps taken
+#define S_VMAX 4          // float bits: CFL max |v + a h|^2 (non-negative -> uint max is float max)
+#define S_ITV 5           // uint: divergence iterations this step
+#define S_IT 6            // uint: pressure iterations this step
+#define S_ERRV 7          // float: last avg divergence error
+#define S_ERR 8           // float: last avg density error
+#define S_ACTV 9          // uint: divergence loop still running
+#define S_ACT 10          // uint: pressure loop still running
+#define S_NBRMAX 11       // uint: max neighbour count seen this step (overflow if > MAX_NBR)
+#define S_PUSH 12         // uint: particles pushed out of a boundary this step
+#define S_TRUNCV 13       // uint: steps whose divergence loop hit the recorded cap (cumulative)
+#define S_TRUNC 14        // uint: same for the pressure loop
+#define S_RECV 15         // uint: recorded divergence iteration slots this step (set by DivInit from _KCapV)
+#define S_REC 16          // uint: recorded pressure slots
+#define S_WORDS 32
+
+// ---------------------------------------------------------------- uniforms
+int _N;
+int _Groups;               // ceil(N / T)
+float _R;                  // particle radius
+float _H;                  // support radius 4 r
+float _H2;
+float _V;                  // 0.8 (2r)^3
+float _Rho0;
+float _InvH, _InvH2;       // CubicKernel_AVX m_invRadius, m_invRadius2 (float)
+float _KAvx, _LAvx;        // CubicKernel_AVX m_k, m_l
+float _W0Avx;              // CubicKernel_AVX W(0)
+float _PreInvStep;         // PrecomputedKernel m_invStepSize
+float _PreRadius2;
+float4 _Gravity;
+float _Visc;               // d * nu * rho0 (d = 10)
+float _ViscEps;            // 0.01 h^2
+float _MaxError, _MaxErrorV;
+int _MinIter, _MaxIter, _MaxIterV;
+int _KCap, _KCapV;         // recorded iteration slots (for the truncation flag)
+float _CflFactor, _CflMin, _CflMax;
+int _NumBodies;
+int _DivEnabled;
+// grid
+float4 _GridMin;
+float _CellInv;
+int4 _GridDim;             // xyz, w = cells
+int _Cells;
+
+// ---------------------------------------------------------------- buffers (RW + read-only views of the same memory)
+struct Nbr { float3 vgw; uint j; };   // V_j gradW(x_i - x_j), neighbour index
+struct Body
+{
+    float4 r0, r1, r2;     // rotation rows R (body -> sim); x_sim = R x_local + t
+    float4 t;              // translation; w = maxVel for the CFL (|v + w x (maxDist,0,0)|, 0 if static)
+    float4 dmin;           // volume-map domain (local frame); w = node offset (asfloat of uint bits NOT used: see off)
+    float4 dmax;
+    float4 cell;           // cell size xyz
+    float4 invCell;        // 1 / cell size
+    uint4 res;             // resolution xyz, w = node offset into _VmNodes
+    float4 vlin;           // linear velocity (sim), w = 1 if moving
+    float4 vang;           // angular velocity (sim)
+};
+
+RWStructuredBuffer<float3> _Pos;
+RWStructuredBuffer<float3> _Vel;
+RWStructuredBuffer<float>  _Dens;
+RWStructuredBuffer<float3> _Acc;
+RWStructuredBuffer<float>  _Factor;
+RWStructuredBuffer<float>  _DensAdv;
+RWStructuredBuffer<float>  _PRho2;
+RWStructuredBuffer<float>  _PRho2V;
+RWStructuredBuffer<float3> _PAcc;
+RWStructuredBuffer<uint>   _NbrCount;
+RWStructuredBuffer<Nbr>    _Nbrs;
+RWStructuredBuffer<float>  _BVol;
+RWStructuredBuffer<float3> _BXj;
+RWStructuredBuffer<uint>   _CellOf;
+RWStructuredBuffer<uint>   _CellCount;
+RWStructuredBuffer<uint>   _CellStart;
+RWStructuredBuffer<uint>   _CellFill;
+RWStructuredBuffer<uint>   _Sorted;
+RWStructuredBuffer<uint>   _State;
+RWStructuredBuffer<float>  _Partial;
+RWStructuredBuffer<uint>   _Args;
+RWStructuredBuffer<uint>   _Stats;      // RING x 16 words
+
+StructuredBuffer<float3> _PosR;
+StructuredBuffer<float3> _VelR;
+StructuredBuffer<float>  _DensR;
+StructuredBuffer<float3> _AccR;
+StructuredBuffer<float>  _FactorR;
+StructuredBuffer<float>  _DensAdvR;
+StructuredBuffer<float>  _PRho2R;
+StructuredBuffer<float>  _PRho2VR;
+StructuredBuffer<float3> _PAccR;
+StructuredBuffer<uint>   _NbrCountR;
+StructuredBuffer<Nbr>    _NbrsR;
+StructuredBuffer<float>  _BVolR;
+StructuredBuffer<float3> _BXjR;
+StructuredBuffer<uint>   _CellStartR;
+StructuredBuffer<uint>   _SortedR;
+StructuredBuffer<uint>   _CellOfR;
+StructuredBuffer<uint>   _StateR;
+StructuredBuffer<float>  _PartialR;
+StructuredBuffer<float>  _WTable;       // PrecomputedKernel m_W[10000]
+StructuredBuffer<float>  _GTable;       // m_gradW[10001]
+StructuredBuffer<Body>   _Bodies;
+StructuredBuffer<float2> _VmNodesR;     // (field 0 = SDF, field 1 = volume) per node, all bodies concatenated
+RWStructuredBuffer<float2> _VmNodes;
+
+// ---------------------------------------------------------------- kernels (functions)
+
+// CubicKernel_AVX::W(r) (scalar lane)
+float WAvx(float rl)
+{
+    float q = rl * _InvH;
+    float v = 1.0f - q;
+    float res1 = _KAvx * (-6.0f * q * q * v + 1.0f);
+    float res2 = _KAvx * 2.0f * (v * v * v);
+    float res = (q <= 1.0f) ? res2 : 0.0f;
+    return (q <= 0.5f) ? res1 : res;
+}
+
+// CubicKernel_AVX::gradW(r)
+float3 GradWAvx(float3 r)
+{
+    float rl = sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
+    float q = rl * _InvH;
+    float res1 = _LAvx * _InvH2 * (3.0f * q - 2.0f);
+    float v = 1.0f - q;
+    float gradq = _InvH / rl;
+    float res2 = gradq * (-_LAvx * (v * v));
+    float res = (q <= 1.0f) ? res2 : 0.0f;
+    res = (q <= 0.5f) ? res1 : res;
+    res = (rl > 1.0e-9f) ? res : 0.0f;
+    return r * res;
+}
+
+// PrecomputedKernel<CubicKernel, 10000>::W(Vector3r)
+float WPre(float3 r)
+{
+    float r2 = dot(r, r);
+    float res = 0.0f;
+    if (r2 <= _PreRadius2)
+    {
+        float rl = sqrt(r2);
+        uint p = min((uint)(rl * _PreInvStep), 9998u);
+        res = 0.5f * (_WTable[p] + _WTable[p + 1]);
+    }
+    return res;
+}
+
+// PrecomputedKernel<CubicKernel, 10000>::gradW(Vector3r) (note: tests rl <= radius, not r2 <= radius2)
+float3 GradWPre(float3 r)
+{
+    float rl = sqrt(dot(r, r));
+    float3 res = 0.0f;
+    if (rl <= _H)
+    {
+        uint p = min((uint)(rl * _PreInvStep), 9998u);
+        res = 0.5f * (_GTable[p] + _GTable[p + 1]) * r;
+    }
+    return res;
+}
+
+float3 BodyPointVel(Body b, float3 x)
+{
+    float3 v = 0.0f;
+    if (b.vlin.w != 0.0f) v = cross(b.vang.xyz, x - b.t.xyz) + b.vlin.xyz;
+    return v;
+}
+
+// ---------------------------------------------------------------- Discregrid cubic Lagrange (shape_function_ order)
+void ShapeFn(float3 xi, out float N[32], out float3 dN[32], bool grad)
+{
+    float x = xi.x, y = xi.y, z = xi.z;
+    float x2 = x * x, y2 = y * y, z2 = z * z;
+    float _1mx = 1 - x, _1my = 1 - y, _1mz = 1 - z, _1px = 1 + x, _1py = 1 + y, _1pz = 1 + z;
+    float _1m3x = 1 - 3 * x, _1m3y = 1 - 3 * y, _1m3z = 1 - 3 * z, _1p3x = 1 + 3 * x, _1p3y = 1 + 3 * y, _1p3z = 1 + 3 * z;
+    float mxmy = _1mx * _1my, mxpy = _1mx * _1py, pxmy = _1px * _1my, pxpy = _1px * _1py;
+    float mxmz = _1mx * _1mz, mxpz = _1mx * _1pz, pxmz = _1px * _1mz, pxpz = _1px * _1pz;
+    float mymz = _1my * _1mz, mypz = _1my * _1pz, pymz = _1py * _1mz, pypz = _1py * _1pz;
+    float _1mx2 = 1 - x2, _1my2 = 1 - y2, _1mz2 = 1 - z2;
+    float fac = 1.0f / 64.0f * (9.0f * (x2 + y2 + z2) - 19.0f);
+    N[0] = fac * mxmy * _1mz; N[1] = fac * pxmy * _1mz; N[2] = fac * mxpy * _1mz; N[3] = fac * pxpy * _1mz;
+    N[4] = fac * mxmy * _1pz; N[5] = fac * pxmy * _1pz; N[6] = fac * mxpy * _1pz; N[7] = fac * pxpy * _1pz;
+    fac = 9.0f / 64.0f * _1mx2; float a = fac * _1m3x, b = fac * _1p3x;
+    N[8] = a * mymz; N[9] = b * mymz; N[10] = a * mypz; N[11] = b * mypz;
+    N[12] = a * pymz; N[13] = b * pymz; N[14] = a * pypz; N[15] = b * pypz;
+    fac = 9.0f / 64.0f * _1my2; a = fac * _1m3y; b = fac * _1p3y;
+    N[16] = a * mxmz; N[17] = b * mxmz; N[18] = a * pxmz; N[19] = b * pxmz;
+    N[20] = a * mxpz; N[21] = b * mxpz; N[22] = a * pxpz; N[23] = b * pxpz;
+    fac = 9.0f / 64.0f * _1mz2; a = fac * _1m3z; b = fac * _1p3z;
+    N[24] = a * mxmy; N[25] = b * mxmy; N[26] = a * mxpy; N[27] = b * mxpy;
+    N[28] = a * pxmy; N[29] = b * pxmy; N[30] = a * pxpy; N[31] = b * pxpy;
+    [unroll] for (int k = 0; k < 32; k++) dN[k] = 0.0f;
+    if (!grad) return;
+    float A = 9.0f * (3.0f * x2 + y2 + z2) - 19.0f;
+    float B = 9.0f * (x2 + 3.0f * y2 + z2) - 19.0f;
+    float C = 9.0f * (x2 + y2 + 3.0f * z2) - 19.0f;
+    float xm = 18 * x - A, xp = 18 * x + A, ym = 18 * y - B, yp = 18 * y + B, zm = 18 * z - C, zp = 18 * z + C;
+    const float i64 = 1.0f / 64.0f;
+    dN[0] = float3(xm * mymz, mxmz * ym, mxmy * zm) * i64;
+    dN[1] = float3(xp * mymz, pxmz * ym, pxmy * zm) * i64;
+    dN[2] = float3(xm * pymz, mxmz * yp, mxpy * zm) * i64;
+    dN[3] = float3(xp * pymz, pxmz * yp, pxpy * zm) * i64;
+    dN[4] = float3(xm * mypz, mxpz * ym, mxmy * zp) * i64;
+    dN[5] = float3(xp * mypz, pxpz * ym, pxmy * zp) * i64;
+    dN[6] = float3(xm * pypz, mxpz * yp, mxpy * zp) * i64;
+    dN[7] = float3(xp * pypz, pxpz * yp, pxpy * zp) * i64;
+    const float s = 9.0f / 64.0f;
+    float mxx = -(3 - 9 * x2) - 2 * x, pxx = (3 - 9 * x2) - 2 * x;
+    a = _1mx2 * _1m3x; b = _1mx2 * _1p3x;
+    dN[8] = float3(mxx * mymz, -a * _1mz, -a * _1my) * s;  dN[9] = float3(pxx * mymz, -b * _1mz, -b * _1my) * s;
+    dN[10] = float3(mxx * mypz, -a * _1pz, a * _1my) * s;  dN[11] = float3(pxx * mypz, -b * _1pz, b * _1my) * s;
+    dN[12] = float3(mxx * pymz, a * _1mz, -a * _1py) * s;  dN[13] = float3(pxx * pymz, b * _1mz, -b * _1py) * s;
+    dN[14] = float3(mxx * pypz, a * _1pz, a * _1py) * s;   dN[15] = float3(pxx * pypz, b * _1pz, b * _1py) * s;
+    float myy = -(3 - 9 * y2) - 2 * y, pyy = (3 - 9 * y2) - 2 * y;
+    a = _1my2 * _1m3y; b = _1my2 * _1p3y;
+    dN[16] = float3(-a * _1mz, myy * mxmz, -a * _1mx) * s; dN[17] = float3(-b * _1mz, pyy * mxmz, -b * _1mx) * s;
+    dN[18] = float3(a * _1mz, myy * pxmz, -a * _1px) * s;  dN[19] = float3(b * _1mz, pyy * pxmz, -b * _1px) * s;
+    dN[20] = float3(-a * _1pz, myy * mxpz, a * _1mx) * s;  dN[21] = float3(-b * _1pz, pyy * mxpz, b * _1mx) * s;
+    dN[22] = float3(a * _1pz, myy * pxpz, a * _1px) * s;   dN[23] = float3(b * _1pz, pyy * pxpz, b * _1px) * s;
+    float mzz = -(3 - 9 * z2) - 2 * z, pzz = (3 - 9 * z2) - 2 * z;
+    a = _1mz2 * _1m3z; b = _1mz2 * _1p3z;
+    dN[24] = float3(-a * _1my, -a * _1mx, mzz * mxmy) * s; dN[25] = float3(-b * _1my, -b * _1mx, pzz * mxmy) * s;
+    dN[26] = float3(-a * _1py, a * _1mx, mzz * mxpy) * s;  dN[27] = float3(-b * _1py, b * _1mx, pzz * mxpy) * s;
+    dN[28] = float3(a * _1my, -a * _1px, mzz * pxmy) * s;  dN[29] = float3(b * _1my, -b * _1px, pzz * pxmy) * s;
+    dN[30] = float3(a * _1py, a * _1px, mzz * pxpy) * s;   dN[31] = float3(b * _1py, b * _1px, pzz * pxpy) * s;
+}
+
+// the 32 node indices of cell (i, j, k) (Discregrid addFunction's cell table), plus the body's node offset
+void CellNodes(uint3 c, uint3 res, uint off, out uint cn[32])
+{
+    uint nx = res.x, ny = res.y, nz = res.z, i = c.x, j = c.y, k = c.z;
+    uint nv = (nx + 1) * (ny + 1) * (nz + 1);
+    uint nex = nx * (ny + 1) * (nz + 1);
+    uint ney = (nx + 1) * ny * (nz + 1);
+    cn[0] = (nx + 1) * (ny + 1) * k + (nx + 1) * j + i;           cn[1] = cn[0] + 1;
+    cn[2] = (nx + 1) * (ny + 1) * k + (nx + 1) * (j + 1) + i;     cn[3] = cn[2] + 1;
+    cn[4] = (nx + 1) * (ny + 1) * (k + 1) + (nx + 1) * j + i;     cn[5] = cn[4] + 1;
+    cn[6] = (nx + 1) * (ny + 1) * (k + 1) + (nx + 1) * (j + 1) + i; cn[7] = cn[6] + 1;
+    uint o = nv;
+    cn[8] = o + 2 * (nx * (ny + 1) * k + nx * j + i);             cn[9] = cn[8] + 1;
+    cn[10] = o + 2 * (nx * (ny + 1) * (k + 1) + nx * j + i);      cn[11] = cn[10] + 1;
+    cn[12] = o + 2 * (nx * (ny + 1) * k + nx * (j + 1) + i);      cn[13] = cn[12] + 1;
+    cn[14] = o + 2 * (nx * (ny + 1) * (k + 1) + nx * (j + 1) + i); cn[15] = cn[14] + 1;
+    o += 2 * nex;
+    cn[16] = o + 2 * (ny * (nz + 1) * i + ny * k + j);            cn[17] = cn[16] + 1;
+    cn[18] = o + 2 * (ny * (nz + 1) * (i + 1) + ny * k + j);      cn[19] = cn[18] + 1;
+    cn[20] = o + 2 * (ny * (nz + 1) * i + ny * (k + 1) + j);      cn[21] = cn[20] + 1;
+    cn[22] = o + 2 * (ny * (nz + 1) * (i + 1) + ny * (k + 1) + j); cn[23] = cn[22] + 1;
+    o += 2 * ney;
+    cn[24] = o + 2 * (nz * (nx + 1) * j + nz * i + k);            cn[25] = cn[24] + 1;
+    cn[26] = o + 2 * (nz * (nx + 1) * (j + 1) + nz * i + k);      cn[27] = cn[26] + 1;
+    cn[28] = o + 2 * (nz * (nx + 1) * j + nz * (i + 1) + k);      cn[29] = cn[28] + 1;
+    cn[30] = o + 2 * (nz * (nx + 1) * (j + 1) + nz * (i + 1) + k); cn[31] = cn[30] + 1;
+    [unroll] for (int q = 0; q < 32; q++) cn[q] += off;
+}
+
+// determineShapeFunctions + interpolate(field 0, with gradient) + interpolate(field 1) at the same cell.
+// Returns false (= dist DBL_MAX in the reference) outside the domain.
+bool InterpBody(Body b, float3 xl, out float dist, out float3 grad, out float vol)
+{
+    dist = 3.0e38f; grad = 0.0f; vol = 0.0f;
+    bool inside = !(any(xl < b.dmin.xyz) || any(xl > b.dmax.xyz));
+    [branch] if (!inside) return false;
+    float3 f = (xl - b.dmin.xyz) * b.invCell.xyz;
+    uint3 mi = (uint3)max(f, 0.0f);
+    mi = min(mi, b.res.xyz - 1u);
+    float3 cmin = b.dmin.xyz + float3(mi) * b.cell.xyz;
+    float3 xi = 2.0f * (xl - cmin) * b.invCell.xyz - 1.0f;
+    float N[32]; float3 dN[32]; uint cn[32];
+    ShapeFn(xi, N, dN, true);
+    CellNodes(mi, b.res.xyz, b.res.w, cn);
+    float phi = 0.0f, v = 0.0f; float3 g = 0.0f;
+    [unroll] for (int q = 0; q < 32; q++)
+    {
+        float2 c = _VmNodesR[cn[q]];
+        phi += c.x * N[q];
+        g += c.x * dN[q];
+        v += c.y * N[q];
+    }
+    dist = phi;
+    grad = g * (2.0f * b.invCell.xyz);
+    vol = v;
+    return true;
+}
+
+// field-0-only interpolation used while BUILDING the map (reads the RW node buffer)
+bool InterpSdf(Body b, float3 xl, out float dist)
+{
+    dist = 3.0e38f;
+    if (any(xl < b.dmin.xyz) || any(xl > b.dmax.xyz)) return false;
+    float3 f = (xl - b.dmin.xyz) * b.invCell.xyz;
+    uint3 mi = (uint3)max(f, 0.0f);
+    mi = min(mi, b.res.xyz - 1u);
+    float3 cmin = b.dmin.xyz + float3(mi) * b.cell.xyz;
+    float3 xi = 2.0f * (xl - cmin) * b.invCell.xyz - 1.0f;
+    float N[32]; float3 dN[32]; uint cn[32];
+    ShapeFn(xi, N, dN, false);
+    CellNodes(mi, b.res.xyz, b.res.w, cn);
+    float phi = 0.0f;
+    [unroll] for (int q = 0; q < 32; q++) phi += _VmNodes[cn[q]].x * N[q];
+    dist = phi;
+    return true;
+}
+
+float3 ToLocal(Body b, float3 x)   // R^T (x - t): dot with the COLUMNS of R (r0..r2 are its rows)
+{
+    float3 d = x - b.t.xyz;
+    return float3(dot(float3(b.r0.x, b.r1.x, b.r2.x), d), dot(float3(b.r0.y, b.r1.y, b.r2.y), d), dot(float3(b.r0.z, b.r1.z, b.r2.z), d));
+}
+float3 ToSimDir(Body b, float3 v)  // R v
+{
+    return float3(dot(b.r0.xyz, v), dot(b.r1.xyz, v), dot(b.r2.xyz, v));
+}
+
+// ---------------------------------------------------------------- neighbour grid
+int3 CellCoord(float3 x)
+{
+    int3 c = (int3)floor((x - _GridMin.xyz) * _CellInv);
+    return clamp(c, 0, _GridDim.xyz - 1);
+}
+uint CellIndex(int3 c) { return (uint)((c.z * _GridDim.y + c.y) * _GridDim.x + c.x); }
+
+[numthreads(T, 1, 1)]
+void GridClear(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x < _Cells) _CellCount[id.x] = 0u;
+}
+
+[numthreads(T, 1, 1)]
+void GridCount(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    uint c = CellIndex(CellCoord(_PosR[i]));
+    _CellOf[i] = c;
+    InterlockedAdd(_CellCount[c], 1u);
+}
+
+groupshared uint gsScan[SCAN_T];
+
+[numthreads(SCAN_T, 1, 1)]
+void GridScan(uint gi : SV_GroupIndex)
+{
+    int per = (_Cells + SCAN_T - 1) / SCAN_T;
+    int b = (int)gi * per, e = min(b + per, _Cells);
+    uint s = 0;
+    for (int c = b; c < e; c++) s += _CellCount[c];
+    gsScan[gi] = s;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint off = 1; off < SCAN_T; off <<= 1)
+    {
+        uint v = gi >= off ? gsScan[gi - off] : 0u;
+        GroupMemoryBarrierWithGroupSync();
+        gsScan[gi] += v;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    uint run = gsScan[gi] - s;
+    for (int c2 = b; c2 < e; c2++) { _CellStart[c2] = run; _CellFill[c2] = run; run += _CellCount[c2]; }
+    if (gi == SCAN_T - 1) _CellStart[_Cells] = gsScan[gi];
+}
+
+[numthreads(T, 1, 1)]
+void GridScatter(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    uint slot;
+    InterlockedAdd(_CellFill[_CellOfR[i]], 1u, slot);
+    _Sorted[slot] = (uint)i;
+}
+
+// insertion sort of each cell's particle indices -> deterministic neighbour order (run-to-run reproducible sums)
+[numthreads(T, 1, 1)]
+void GridSortCells(uint3 id : SV_DispatchThreadID)
+{
+    int c = (int)id.x;
+    if (c >= _Cells) return;
+    uint b = _CellStartR[c], e = _CellStartR[c + 1];
+    for (uint p = b + 1; p < e; p++)
+    {
+        uint v = _Sorted[p];
+        uint q = p;
+        [loop] while (q > b)
+        {
+            uint u = _Sorted[q - 1];
+            if (u <= v) break;
+            _Sorted[q] = u;
+            q--;
+        }
+        _Sorted[q] = v;
+    }
+}
+
+// CompactNSearch: j != i with |x_i - x_j|^2 < h^2; precomputeValues: V_j * CubicKernel_AVX::gradW(x_i - x_j)
+[numthreads(T, 1, 1)]
+void Neighbours(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float3 xi = _PosR[i];
+    int3 c = CellCoord(xi);
+    uint n = 0;
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        int3 cc = c + int3(dx, dy, dz);
+        if (any(cc < 0) || any(cc >= _GridDim.xyz)) continue;
+        uint ci = CellIndex(cc);
+        for (uint s = _CellStartR[ci], e = _CellStartR[ci + 1]; s < e; s++)
+        {
+            uint j = _SortedR[s];
+            if ((int)j == i) continue;
+            float3 r = xi - _PosR[j];
+            if (dot(r, r) < _H2)
+            {
+                if (n < MAX_NBR)
+                {
+                    Nbr nb; nb.vgw = GradWAvx(r) * _V; nb.j = j;
+                    _Nbrs[i * MAX_NBR + n] = nb;
+                }
+                n++;
+            }
+        }
+    }
+    _NbrCount[i] = min(n, (uint)MAX_NBR);
+    InterlockedMax(_State[S_NBRMAX], n);
+}
+
+// TimeStep::computeVolumeAndBoundaryX (Bender 2019). Bodies in order; a push-out moves x_i for the later bodies.
+[numthreads(T, 1, 1)]
+void Boundary(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float3 xi = _Pos[i];
+    for (int bi = 0; bi < _NumBodies; bi++)
+    {
+        Body b = _Bodies[bi];
+        float bvol = 0.0f;
+        float3 bxj = 0.0f;
+        float dist, vol; float3 grad;
+        bool chk = InterpBody(b, ToLocal(b, xi), dist, grad, vol);
+        bool animate = false;
+        if (chk && dist > 0.0f && dist < _H)
+        {
+            if (vol > 0.0f)
+            {
+                bvol = vol;
+                float3 nrm = ToSimDir(b, grad);
+                float nl = length(nrm);
+                if (nl > 1.0e-9f)
+                {
+                    nrm /= nl;
+                    float d = max(dist + 0.5f * _R, 2.0f * _R);
+                    bxj = xi - d * nrm;
+                }
+                else bvol = 0.0f;
+            }
+        }
+        else if (chk && dist <= 0.0f)
+        {
+            animate = true;
+        }
+        if (animate)
+        {
+            float3 nrm = ToSimDir(b, grad);
+            float nl = length(nrm);
+            if (nl > 1.0e-5f)
+            {
+                nrm /= nl;
+                float delta = min(2.0f * _R - dist, 0.1f * _R);
+                xi = xi + delta * nrm;
+                _Pos[i] = xi;
+                _Vel[i] = 0.0f;
+                InterlockedAdd(_State[S_PUSH], 1u);
+            }
+            bvol = 0.0f;
+        }
+        _BVol[bi * _N + i] = bvol;
+        _BXj[bi * _N + i] = bxj;
+    }
+}
+
+// TimeStep::computeDensities (AVX): V W0 + sum V W_avx(x_i - x_j) [current positions] + sum_b Vb W_pre(x_i - x_b)
+[numthreads(T, 1, 1)]
+void Density(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float3 xi = _PosR[i];
+    float d = _V * _W0Avx;
+    float s = 0.0f;
+    uint n = _NbrCountR[i];
+    for (uint k = 0; k < n; k++)
+    {
+        uint j = _NbrsR[i * MAX_NBR + k].j;
+        float3 r = xi - _PosR[j];
+        s += _V * WAvx(sqrt(r.x * r.x + r.y * r.y + r.z * r.z));
+    }
+    d += s;
+    for (int bi = 0; bi < _NumBodies; bi++)
+    {
+        float vb = _BVolR[bi * _N + i];
+        if (vb > 0.0f) d += vb * WPre(xi - _BXjR[bi * _N + i]);
+    }
+    _Dens[i] = d * _Rho0;
+}
+
+// computeDFSPHFactor (AVX)
+[numthreads(T, 1, 1)]
+void Factor(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float3 xi = _PosR[i];
+    float sum = 0.0f;
+    float3 gi = 0.0f;
+    uint n = _NbrCountR[i];
+    for (uint k = 0; k < n; k++)
+    {
+        float3 g = _NbrsR[i * MAX_NBR + k].vgw;
+        sum += dot(g, g);
+        gi += g;
+    }
+    for (int bi = 0; bi < _NumBodies; bi++)
+    {
+        float vb = _BVolR[bi * _N + i];
+        if (vb > 0.0f) gi += vb * GradWPre(xi - _BXjR[bi * _N + i]);   // grad_p_i -= -Vb gradW
+    }
+    sum += dot(gi, gi);
+    _Factor[i] = sum > EPS ? 1.0f / sum : 0.0f;
+}
+
+// sum_j (v_i - v_j) . V gradW + sum_b Vb (v_i - v_b(x_b)) . gradW_pre(x_i - x_b)
+float DivergenceOf(int i)
+{
+    float3 xi = _PosR[i];
+    float3 vi = _Vel[i];
+    float s = 0.0f;
+    uint n = _NbrCountR[i];
+    for (uint k = 0; k < n; k++)
+    {
+        Nbr nb = _NbrsR[i * MAX_NBR + k];
+        s += dot(vi - _Vel[nb.j], nb.vgw);
+    }
+    for (int bi = 0; bi < _NumBodies; bi++)
+    {
+        float vb = _BVolR[bi * _N + i];
+        if (vb > 0.0f)
+        {
+            float3 xb = _BXjR[bi * _N + i];
+            s += vb * dot(vi - BodyPointVel(_Bodies[bi], xb), GradWPre(xi - xb));
+        }
+    }
+    return s;
+}
+
+// divergenceSolve, first loop: computeDensityChange, factor *= 1/h, warm start. Thread 0 arms the iteration loop.
+[numthreads(T, 1, 1)]
+void DivInit(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i == 0)
+    {
+        _State[S_ITV] = 0u; _State[S_ACTV] = 1u; _State[S_RECV] = (uint)_KCapV;
+        _Args[0] = (uint)_Groups; _Args[1] = 1u; _Args[2] = 1u;
+    }
+    if (i >= _N) return;
+    float h = asfloat(_State[S_HOLD]);
+    float invH = 1.0f / h;
+    float da = DivergenceOf(i);
+    _DensAdv[i] = da;
+    float local = max(da, 0.0f);
+    if (_NbrCountR[i] < 20u) local = 0.0f;
+    _Factor[i] = _Factor[i] * invH;
+    float pv = _PRho2V[i];
+    _PRho2V[i] = local > 0.0f ? 0.5f * min(pv, 0.5f) * invH : 0.0f;
+}
+
+// computePressureAccel: a_i = -sum_j V gradW (p_i + p_j) + [|p_i| > eps] sum_b p_i (-Vb gradW_pre(x_i - x_b))
+float3 PressureAccelOf(int i, bool v)
+{
+    float pi = v ? _PRho2VR[i] : _PRho2R[i];
+    float3 xi = _PosR[i];
+    float3 a = 0.0f;
+    uint n = _NbrCountR[i];
+    for (uint k = 0; k < n; k++)
+    {
+        Nbr nb = _NbrsR[i * MAX_NBR + k];
+        float pj = v ? _PRho2VR[nb.j] : _PRho2R[nb.j];
+        a -= nb.vgw * (pi + pj);
+    }
+    if (abs(pi) > EPS)
+    {
+        for (int bi = 0; bi < _NumBodies; bi++)
+        {
+            float vb = _BVolR[bi * _N + i];
+            if (vb > 0.0f) a += pi * (-vb * GradWPre(xi - _BXjR[bi * _N + i]));
+        }
+    }
+    return a;
+}
+
+[numthreads(T, 1, 1)]
+void PAccelV(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    _PAcc[i] = PressureAccelOf(i, true);
+}
+
+[numthreads(T, 1, 1)]
+void PAccel(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    _PAcc[i] = PressureAccelOf(i, false);
+}
+
+// compute_aij_pj: sum_j (a_i - a_j) . V gradW + sum_b Vb a_i . gradW_pre(x_i - x_b)
+float AijPj(int i)
+{
+    float3 xi = _PosR[i];
+    float3 ai = _PAccR[i];
+    float s = 0.0f;
+    uint n = _NbrCountR[i];
+    for (uint k = 0; k < n; k++)
+    {
+        Nbr nb = _NbrsR[i * MAX_NBR + k];
+        s += dot(ai - _PAccR[nb.j], nb.vgw);
+    }
+    for (int bi = 0; bi < _NumBodies; bi++)
+    {
+        float vb = _BVolR[bi * _N + i];
+        if (vb > 0.0f) s += vb * dot(ai, GradWPre(xi - _BXjR[bi * _N + i]));
+    }
+    return s;
+}
+
+groupshared float gsSum[T];
+
+void GroupSumToPartial(uint gi, uint gid, float v)
+{
+    gsSum[gi] = v;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = T / 2; s > 0; s >>= 1)
+    {
+        if (gi < s) gsSum[gi] += gsSum[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) _Partial[gid] = gsSum[0];
+}
+
+// divergenceSolveIteration, update loop
+[numthreads(T, 1, 1)]
+void DivUpdate(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    int i = (int)id.x;
+    float err = 0.0f;
+    if (i < _N)
+    {
+        float h = asfloat(_StateR[S_HOLD]);
+        float aij = AijPj(i) * h;
+        float si = -_DensAdvR[i];
+        float res = min(si - aij, 0.0f);
+        if (_NbrCountR[i] < 20u) res = 0.0f;
+        _PRho2V[i] = max(_PRho2V[i] - 0.5f * (si - aij) * _FactorR[i], 0.0f);
+        err = -_Rho0 * res;
+    }
+    GroupSumToPartial(gi, gid.x, err);
+}
+
+groupshared float gsChk[CHECK_T];
+
+float SumPartials(uint gi)
+{
+    float s = 0.0f;
+    for (int g = (int)gi; g < _Groups; g += CHECK_T) s += _PartialR[g];
+    gsChk[gi] = s;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint k = CHECK_T / 2; k > 0; k >>= 1)
+    {
+        if (gi < k) gsChk[gi] += gsChk[gi + k];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    return gsChk[0];
+}
+
+// end of one divergence iteration: avg error, loop condition `while ((!chk || it < 1) && it < maxIterV)`, next args
+[numthreads(CHECK_T, 1, 1)]
+void DivCheck(uint gi : SV_GroupIndex)
+{
+    float total = SumPartials(gi);          // always (uniform barriers); used only while the loop is active
+    if (gi == 0 && _State[S_ACTV] != 0u)
+    {
+        float h = asfloat(_State[S_HOLD]);
+        float avg = total / (float)_N;
+        float eta = (1.0f / h) * _MaxErrorV * 0.01f * _Rho0;
+        bool chk = avg <= eta;
+        uint it = _State[S_ITV] + 1u;
+        _State[S_ITV] = it;
+        _State[S_ERRV] = asuint(avg);
+        bool more = (!chk || it < 1u) && it < (uint)_MaxIterV;
+        if (!more)
+        {
+            _State[S_ACTV] = 0u;
+            _Args[0] = 0u;
+        }
+        else if (it >= (uint)_KCapV)
+        {
+            _State[S_TRUNCV] = _State[S_TRUNCV] + 1u;   // the recorded slots run out with the loop still active
+        }
+    }
+}
+
+// end of divergenceSolve: v += h a(pv); factor *= h; pv *= h (warm start for the next step)
+[numthreads(T, 1, 1)]
+void DivFinal(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float h = asfloat(_StateR[S_HOLD]);
+    _Vel[i] = _Vel[i] + h * _PAccR[i];
+    _Factor[i] = _Factor[i] * h;
+    _PRho2V[i] = _PRho2V[i] * h;
+}
+
+// clearAccelerations + Viscosity_Standard (AVX): a_i = g + sum_j V gradW (d nu rho0 / rho_j) (v_ij . x_ij) / (|x_ij|^2 + 0.01 h^2)
+[numthreads(T, 1, 1)]
+void NonPressure(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float3 xi = _PosR[i];
+    float3 vi = _VelR[i];
+    float3 s = 0.0f;
+    uint n = _NbrCountR[i];
+    for (uint k = 0; k < n; k++)
+    {
+        Nbr nb = _NbrsR[i * MAX_NBR + k];
+        float3 xij = xi - _PosR[nb.j];
+        float c = (_Visc / _DensR[nb.j]) * dot(vi - _VelR[nb.j], xij) / (dot(xij, xij) + _ViscEps);
+        s += nb.vgw * c;
+    }
+    _Acc[i] = _Gravity.xyz + s;
+}
+
+groupshared float gsMax[T];
+
+// updateTimeStepSizeCFL, fluid part: max |v + a h|^2 with h = the step's old dt
+[numthreads(T, 1, 1)]
+void CflReduce(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    int i = (int)id.x;
+    float m = 0.0f;
+    if (i < _N)
+    {
+        float h = asfloat(_State[S_HOLD]);
+        float3 w = _VelR[i] + _AccR[i] * h;
+        m = dot(w, w);
+    }
+    gsMax[gi] = m;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = T / 2; s > 0; s >>= 1)
+    {
+        if (gi < s) gsMax[gi] = max(gsMax[gi], gsMax[gi + s]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) InterlockedMax(_State[S_VMAX], asuint(gsMax[0]));
+}
+
+[numthreads(1, 1, 1)]
+void CflFinal(uint3 id : SV_DispatchThreadID)
+{
+    float maxVel = asfloat(_State[S_VMAX]);
+    for (int bi = 0; bi < _NumBodies; bi++) maxVel = max(maxVel, _Bodies[bi].t.w);   // |v_body| (not squared), as the source
+    if (maxVel < 1.0e-9f) maxVel = 1.0e-9f;
+    float h = _CflFactor * 0.4f * ((2.0f * _R) / sqrt(maxVel));
+    h = min(h, _CflMax);
+    h = max(h, _CflMin);
+    _State[S_HNEW] = asuint(h);
+}
+
+[numthreads(T, 1, 1)]
+void IntegrateVel(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float h = asfloat(_StateR[S_HOLD]);
+    _Vel[i] = _Vel[i] + h * _AccR[i];
+}
+
+// pressureSolve, first loop with the NEW dt: rho_adv = rho/rho0 + h div, factor *= 1/h^2, warm start
+[numthreads(T, 1, 1)]
+void PresInit(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i == 0)
+    {
+        _State[S_IT] = 0u; _State[S_ACT] = 1u; _State[S_REC] = (uint)_KCap;
+        _Args[3] = (uint)_Groups; _Args[4] = 1u; _Args[5] = 1u;
+    }
+    if (i >= _N) return;
+    float h = asfloat(_State[S_HNEW]);
+    float invH2 = 1.0f / (h * h);
+    float da = _DensR[i] / _Rho0 + h * DivergenceOf(i);
+    _DensAdv[i] = da;
+    _Factor[i] = _Factor[i] * invH2;
+    float p = _PRho2[i];
+    _PRho2[i] = da > 1.0f ? 0.5f * min(p, 0.00025f) * invH2 : 0.0f;
+}
+
+// pressureSolveIteration, update loop
+[numthreads(T, 1, 1)]
+void PresUpdate(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    int i = (int)id.x;
+    float err = 0.0f;
+    if (i < _N)
+    {
+        float h = asfloat(_StateR[S_HNEW]);
+        float aij = AijPj(i) * h * h;
+        float si = 1.0f - _DensAdvR[i];
+        float res = min(si - aij, 0.0f);
+        _PRho2[i] = max(_PRho2[i] - 0.5f * (si - aij) * _FactorR[i], 0.0f);
+        err = -_Rho0 * res;
+    }
+    GroupSumToPartial(gi, gid.x, err);
+}
+
+// `while ((!chk || it < minIterations) && it < maxIterations)`, eta = maxError % rho0
+[numthreads(CHECK_T, 1, 1)]
+void PresCheck(uint gi : SV_GroupIndex)
+{
+    float total = SumPartials(gi);
+    if (gi == 0 && _State[S_ACT] != 0u)
+    {
+        float avg = total / (float)_N;
+        float eta = _MaxError * 0.01f * _Rho0;
+        bool chk = avg <= eta;
+        uint it = _State[S_IT] + 1u;
+        _State[S_IT] = it;
+        _State[S_ERR] = asuint(avg);
+        bool more = (!chk || it < (uint)_MinIter) && it < (uint)_MaxIter;
+        if (!more)
+        {
+            _State[S_ACT] = 0u;
+            _Args[3] = 0u;
+        }
+        else if (it >= (uint)_KCap)
+        {
+            _State[S_TRUNC] = _State[S_TRUNC] + 1u;
+        }
+    }
+}
+
+// end of pressureSolve: v += h a(p); p *= h^2
+[numthreads(T, 1, 1)]
+void PresFinal(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float h = asfloat(_StateR[S_HNEW]);
+    _Vel[i] = _Vel[i] + h * _PAccR[i];
+    _PRho2[i] = _PRho2[i] * (h * h);
+}
+
+[numthreads(T, 1, 1)]
+void IntegratePos(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _N) return;
+    float h = asfloat(_StateR[S_HOLD]);
+    _Pos[i] = _Pos[i] + h * _VelR[i];
+}
+
+// t += old dt; stats record; old dt := new dt; per-step counters reset
+[numthreads(1, 1, 1)]
+void EndStep(uint3 id : SV_DispatchThreadID)
+{
+    float hOld = asfloat(_State[S_HOLD]);
+    float hNew = asfloat(_State[S_HNEW]);
+    float t = asfloat(_State[S_TIME]) + hOld;
+    uint step = _State[S_STEP];
+    uint o = (step % RING) * 16u;
+    _Stats[o + 0] = step;
+    _Stats[o + 1] = asuint(t);
+    _Stats[o + 2] = asuint(hOld);
+    _Stats[o + 3] = asuint(hNew);
+    _Stats[o + 4] = _State[S_ITV];
+    _Stats[o + 5] = _State[S_IT];
+    _Stats[o + 6] = _State[S_ERRV];
+    _Stats[o + 7] = _State[S_ERR];
+    _Stats[o + 8] = _State[S_NBRMAX];
+    _Stats[o + 9] = _State[S_PUSH];
+    _Stats[o + 10] = _State[S_TRUNCV];
+    _Stats[o + 11] = _State[S_TRUNC];
+    _Stats[o + 12] = asuint(sqrt(asfloat(_State[S_VMAX])));
+    _Stats[o + 13] = _State[S_RECV];
+    _Stats[o + 14] = _State[S_REC];
+    _Stats[o + 15] = 0xD5F5u;
+    _State[S_TIME] = asuint(t);
+    _State[S_HOLD] = asuint(hNew);
+    _State[S_STEP] = step + 1u;
+    _State[S_VMAX] = 0u;
+    _State[S_NBRMAX] = 0u;
+    _State[S_PUSH] = 0u;
+    _State[S_ITV] = 0u;
+    _State[S_IT] = 0u;
+}
+
+// ---------------------------------------------------------------- volume-map build (SimulatorBase::initVolumeMap)
+int _VmBody;            // body slot being built
+int _VmShape;           // 0 box (half extents), 1 sphere (radius), 2 torus (major, minor; axis y)
+float4 _VmShapeParam;
+float _VmSign;          // -1 if mapInvert
+float _VmThickness;
+int _VmNodeStart;       // chunk start (body-local node index)
+int _VmNodeCount;       // nodes in this chunk
+int _VmNodesTotal;      // nodes of this body
+
+float SdfPrimitive(float3 p)
+{
+    float d;
+    if (_VmShape == 0)
+    {
+        float3 q = abs(p) - _VmShapeParam.xyz;
+        d = length(max(q, 0.0f)) + min(max(q.x, max(q.y, q.z)), 0.0f);
+    }
+    else if (_VmShape == 1) d = length(p) - _VmShapeParam.x;
+    else
+    {
+        float2 q2 = float2(length(p.xz) - _VmShapeParam.x, p.y);
+        d = length(q2) - _VmShapeParam.y;
+    }
+    return d;
+}
+
+// CubicLagrangeDiscreteGrid::indexToNodePosition (local frame)
+float3 NodePosition(Body b, uint l)
+{
+    uint3 n = b.res.xyz;
+    uint nv = (n.x + 1) * (n.y + 1) * (n.z + 1);
+    uint nex = n.x * (n.y + 1) * (n.z + 1);
+    uint ney = (n.x + 1) * n.y * (n.z + 1);
+    uint3 ijk; float3 off = 0.0f;
+    if (l < nv)
+    {
+        ijk.z = l / ((n.y + 1) * (n.x + 1)); uint t = l % ((n.y + 1) * (n.x + 1));
+        ijk.y = t / (n.x + 1); ijk.x = t % (n.x + 1);
+    }
+    else if (l < nv + 2 * nex)
+    {
+        l -= nv; uint e = l / 2;
+        ijk.z = e / ((n.y + 1) * n.x); uint t = e % ((n.y + 1) * n.x);
+        ijk.y = t / n.x; ijk.x = t % n.x;
+        off.x = (1.0f + (float)(l % 2)) / 3.0f * b.cell.x;
+    }
+    else if (l < nv + 2 * (nex + ney))
+    {
+        l -= nv + 2 * nex; uint e = l / 2;
+        ijk.x = e / ((n.z + 1) * n.y); uint t = e % ((n.z + 1) * n.y);
+        ijk.z = t / n.y; ijk.y = t % n.y;
+        off.y = (1.0f + (float)(l % 2)) / 3.0f * b.cell.y;
+    }
+    else
+    {
+        l -= nv + 2 * (nex + ney); uint e = l / 2;
+        ijk.y = e / ((n.x + 1) * n.z); uint t = e % ((n.x + 1) * n.z);
+        ijk.x = t / n.z; ijk.z = t % n.z;
+        off.z = (1.0f + (float)(l % 2)) / 3.0f * b.cell.z;
+    }
+    return b.dmin.xyz + b.cell.xyz * float3(ijk) + off;
+}
+
+StructuredBuffer<float4> _VmPos;   // node positions of the body being built (double on the CPU -> float), w = inside flag
+
+[numthreads(T, 1, 1)]
+void VmSdf(uint3 id : SV_DispatchThreadID)
+{
+    int l = _VmNodeStart + (int)id.x;
+    if ((int)id.x >= _VmNodeCount || l >= _VmNodesTotal) return;
+    Body b = _Bodies[_VmBody];
+    float3 x = _VmPos[l].xyz;
+    _VmNodes[b.res.w + l] = float2(_VmSign * (SdfPrimitive(x) - _VmThickness), 0.0f);
+}
+
+static const float GL_A[16] = { -0.98940093499164994, -0.9445750230732326, -0.86563120238783176, -0.755404408355003, -0.61787624440264377, -0.45801677765722737, -0.28160355077925892, -0.095012509837637454, 0.095012509837637454, 0.28160355077925892, 0.45801677765722737, 0.61787624440264377, 0.755404408355003, 0.86563120238783176, 0.9445750230732326, 0.98940093499164994 };
+static const float GL_W[16] = { 0.027152459411754037, 0.062253523938647706, 0.095158511682492591, 0.12462897125553403, 0.14959598881657676, 0.16915651939500262, 0.18260341504492361, 0.18945061045506859, 0.18945061045506859, 0.18260341504492361, 0.16915651939500262, 0.14959598881657676, 0.12462897125553403, 0.095158511682492591, 0.062253523938647706, 0.027152459411754037 };
+
+float _CubicK;          // CubicKernel m_k (non-AVX, float)
+float _CubicW0;         // CubicKernel::W_zero()
+
+float CubicW(float r)   // SPH::CubicKernel::W (float)
+{
+    float q = r / _H;
+    float res = 0.0f;
+    if (q <= 1.0f)
+    {
+        if (q <= 0.5f) { float q2 = q * q; float q3 = q2 * q; res = _CubicK * (6.0f * q3 - 6.0f * q2 + 1.0f); }
+        else { float v = 1.0f - q; res = _CubicK * (2.0f * (v * v * v)); }
+    }
+    return res;
+}
+
+// field 1: 0.8 * GaussQuadrature::integrate(integrand, [-h,h]^3, p = 30) (16^3 points), Kahan-summed in float
+[numthreads(64, 1, 1)]
+void VmVolume(uint3 id : SV_DispatchThreadID)
+{
+    int l = _VmNodeStart + (int)id.x;
+    if ((int)id.x >= _VmNodeCount || l >= _VmNodesTotal) return;
+    Body b = _Bodies[_VmBody];
+    float4 xp = _VmPos[l];
+    float3 x = xp.xyz;
+    float distX = xp.w > 0.5f ? _VmNodes[b.res.w + l].x : 3.0e38f;   // interpolate(0, node) = the node value; DBL_MAX outside
+    float res = 0.0f;
+    if (distX <= 2.0f * _H)
+    {
+        float sum = 0.0f, comp = 0.0f;
+        for (int a = 0; a < 16; a++)
+        for (int c = 0; c < 16; c++)
+        {
+            float wac = GL_W[a] * GL_W[c];
+            for (int e = 0; e < 16; e++)
+            {
+                float3 xi = _H * float3(GL_A[a], GL_A[c], GL_A[e]);
+                if (dot(xi, xi) > _H * _H) continue;
+                float d;
+                bool inside = InterpSdf(b, x + xi, d);
+                float f = 0.0f;
+                if (inside)
+                {
+                    if (d <= 0.0f) f = 1.0f;
+                    else if (d < _H) f = CubicW(d) / _CubicW0;
+                }
+                float y = wac * GL_W[e] * f - comp;
+                float s2 = sum + y;
+                comp = (s2 - sum) - y;
+                sum = s2;
+            }
+        }
+        res = 0.8f * sum * (_H * _H * _H);
+    }
+    _VmNodes[b.res.w + l] = float2(_VmNodes[b.res.w + l].x, res);
+}
+
+// ---------------------------------------------------------------- probes for the known-answer gates (K0, M1)
+StructuredBuffer<float4> _ProbeIn;
+RWStructuredBuffer<float4> _ProbeOut;
+int _ProbeCount;
+
+// in: (r vector xyz, unused) -> out0: (W_avx(|r|), W_pre(r), |gradW_avx|, |gradW_pre|), out1: (gradW_pre xyz, 0)
+[numthreads(T, 1, 1)]
+void ProbeKernels(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _ProbeCount) return;
+    float3 r = _ProbeIn[i].xyz;
+    float3 ga = GradWAvx(r);
+    float3 gp = GradWPre(r);
+    _ProbeOut[2 * i] = float4(WAvx(sqrt(r.x * r.x + r.y * r.y + r.z * r.z)), WPre(r), ga.x, gp.x);
+    _ProbeOut[2 * i + 1] = float4(ga.y, ga.z, gp.y, gp.z);
+}
+
+// in: sim-space point, w = body -> out0: (dist, vol, chk, 0), out1: (grad xyz, 0)
+[numthreads(T, 1, 1)]
+void ProbeBoundary(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _ProbeCount) return;
+    float4 p = _ProbeIn[i];
+    Body b = _Bodies[(int)p.w];
+    float dist, vol; float3 grad;
+    bool chk = InterpBody(b, ToLocal(b, p.xyz), dist, grad, vol);
+    _ProbeOut[2 * i] = float4(dist, vol, chk ? 1.0f : 0.0f, 0.0f);
+    _ProbeOut[2 * i + 1] = float4(grad, 0.0f);
+}

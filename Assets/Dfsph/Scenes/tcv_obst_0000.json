@@ -1,0 +1,199 @@
+{
+    "Configuration": {
+        "DFSPH": {
+            "enableDivergenceSolver": true,
+            "maxError": 0.05000000074505806,
+            "maxErrorV": 0.10000000149011612,
+            "maxIterations": 100,
+            "maxIterationsV": 100,
+            "minIterations": 2
+        },
+        "boundaryHandlingMethod": 2,
+        "cflFactor": 1.0,
+        "cflMaxTimeStepSize": 0.004999999888241291,
+        "cflMethod": 1,
+        "cflMinTimeStepSize": 9.999999747378752e-05,
+        "dataExportFPS": 25.0,
+        "enableAsyncExport": false,
+        "enablePartioExport": true,
+        "enableRigidBodyExport": true,
+        "enableRigidBodyOBJExport": false,
+        "enableRigidBodyPLYExport": false,
+        "enableRigidBodyVTKExport": false,
+        "enableStateExport": false,
+        "enableVTKExport": false,
+        "enableZSort": true,
+        "gradKernel": 4,
+        "gravitation": [
+            -0.0261,
+            -9.1025,
+            -0.6712
+        ],
+        "kernel": 4,
+        "numberOfStepsPerRenderUpdate": 4,
+        "particleAttributes": "position;velocity;density",
+        "partioAttributes": "position;velocity;density",
+        "particleRadius": 0.04357250000000001,
+        "pause": true,
+        "pauseAt": -1.0,
+        "renderWalls": 4,
+        "simulationMethod": 4,
+        "stateExportFPS": 1.0,
+        "stepsPerZSort": 500,
+        "stopAt": 1.5,
+        "timeStepSize": 0.0015399523545056581
+    },
+    "FluidBlocks": [
+        {
+            "denseMode": 0,
+            "end": [
+                2.0254137500000002,
+                1.6382137500000002,
+                2.69471375
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "start": [
+                0.8707425,
+                0.4835425,
+                1.5400425
+            ],
+            "translation": [
+                0.0,
+                0.0,
+                0.0
+            ]
+        }
+    ],
+    "Materials": [
+        {
+            "Standard viscosity": {
+                "viscosity": 0.009999999776482582,
+                "viscosityBoundary": 0.0
+            },
+            "XSPH": {
+                "xsph": 0.0,
+                "xsphBoundary": 0.0
+            },
+            "colorField": "velocity",
+            "colorMapType": 5,
+            "density0": 1000,
+            "dragMethod": 0,
+            "elasticityMethod": 0,
+            "id": "Fluid",
+            "renderMaxValue": 4.600371837615967,
+            "renderMinValue": 0.024852702394127846,
+            "surfaceTensionMethod": 0,
+            "viscosityMethod": 1,
+            "visible": true,
+            "vorticityMethod": 0
+        }
+    ],
+    "RigidBodies": [
+        {
+            "color": [
+                0.1,
+                0.4,
+                0.6,
+                1.0
+            ],
+            "geometryFile": "/home/matias/Desktop/SSU_restart/Assets/models/UnitBox.obj",
+            "isDynamic": false,
+            "isWall": true,
+            "mapInvert": true,
+            "mapResolution": [
+                30,
+                30,
+                30
+            ],
+            "mapThickness": 0.0,
+            "rotationAngle": 0,
+            "rotationAxis": [
+                1,
+                0,
+                0
+            ],
+            "scale": [
+                3,
+                3,
+                3
+            ],
+            "translation": [
+                1.5,
+                1.5,
+                1.5
+            ]
+        },
+        {
+            "id": 2,
+            "geometryFile": "/home/matias/anaconda3/bin/data/models/torus.obj",
+            "translation": [
+                1.6843,
+                0.7917,
+                1.002
+            ],
+            "rotationAxis": [
+                -0.6486,
+                0.9046,
+                -0.4248
+            ],
+            "rotationAngle": 2.8669,
+            "scale": [
+                0.3265,
+                0.3265,
+                0.3265
+            ],
+            "color": [
+                0.3,
+                0.5,
+                0.8,
+                1.0
+            ],
+            "isDynamic": false,
+            "isWall": false,
+            "restitution": 0.6,
+            "friction": 0.2,
+            "collisionObjectType": 4,
+            "collisionObjectScale": [
+                0.3265,
+                0.16325,
+                0.3265
+            ],
+            "mapInvert": false,
+            "mapThickness": 0.0,
+            "mapResolution": [
+                20,
+                20,
+                20
+            ]
+        }
+    ],
+    "Simulation": {
+        "timeStepSize": 0.005,
+        "maxIter": 5,
+        "maxIterVel": 5,
+        "velocityUpdateMethod": 0,
+        "contactTolerance": 0.06,
+        "tetModelSimulationMethod": 2,
+        "triangleModelSimulationMethod": 2,
+        "triangleModelBendingMethod": 2,
+        "contactStiffnessRigidBody": 1.0,
+        "contactStiffnessParticleRigidBody": 100.0,
+        "cloth_stiffness": 1.0,
+        "cloth_bendingStiffness": 0.005,
+        "cloth_xxStiffness": 1.0,
+        "cloth_yyStiffness": 1.0,
+        "cloth_xyStiffness": 1.0,
+        "cloth_xyPoissonRatio": 0.3,
+        "cloth_yxPoissonRatio": 0.3,
+        "cloth_normalizeStretch": 0,
+        "cloth_normalizeShear": 0,
+        "solid_stiffness": 1.0,
+        "solid_poissonRatio": 0.2,
+        "solid_normalizeStretch": 0,
+        "solid_normalizeShear": 0
+    }
+}

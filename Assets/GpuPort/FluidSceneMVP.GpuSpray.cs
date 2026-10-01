@@ -15,7 +15,7 @@ public partial class FluidSceneMVP
 
     GpuSprayLayer gpuSprayLayer;
     CommandBuffer gpuSprayCb;
-    GpuSphProvider gpuSprayProvider;
+    IGpuSimSource gpuSprayProvider;           // GPU PBF or GPU DFSPH
     float gpuSprayTimeLast = -1f;
     int gpuSprayPlayFrameLast = -1;
     string gpuSprayError;
@@ -43,7 +43,7 @@ public partial class FluidSceneMVP
                 if (m != null && m.sig_in > 0f) gpuSprayLayer.sigIn = m.sig_in;
             }
             gpuSprayCb = new CommandBuffer { name = "GPU1001.SprayStep" };
-            gpuSprayProvider = provider as GpuSphProvider;
+            gpuSprayProvider = provider as IGpuSimSource;
             if (gpuSprayProvider != null) gpuSprayProvider.OnSolverStepGpu += OnGpuSpraySolverStep;
             gpuSprayTimeLast = -1f; gpuSprayPlayFrameLast = -1;
             Debug.Log($"FluidSceneMVP: GPU1001 learned spray ON — model {asset.name}, sig_in {gpuSprayLayer.sigIn:F4}, " +
@@ -77,18 +77,18 @@ public partial class FluidSceneMVP
         L.launchSpeed = sprayLaunchSpeed;
         L.dropletRadius = sprayDropletRadius;
         L.maxDroplets = Mathf.Max(sprayMaxDroplets, 0);
-        var gpu = provider as GpuSphProvider;
-        L.frameDt = 1.0 / (gpu != null ? gpu.simHz : (provider.NativeFps > 0f ? provider.NativeFps : 25f));
+        var gpu = provider as IGpuSimSource;
+        L.frameDt = 1.0 / (gpu != null ? gpu.SimHz : (provider.NativeFps > 0f ? provider.NativeFps : 25f));
         L.obstacles.Clear();
         if (gpu == null) return;
-        L.gravity = gpu.gravity;
-        L.domainMin = gpu.domainMin; L.domainMax = gpu.domainMax;
-        if (gpu.obstacles == null) return;
+        L.gravity = gpu.Gravity;
+        L.domainMin = gpu.DomainMin; L.domainMax = gpu.DomainMax;
+        if (gpu.SceneObstacles == null) return;
         // as ApplySprayKnobs (G2): GpuSphProvider.AdvanceObstacles' sim -> world mapping, obstacle pose of this solver frame
-        Vector3 off = new Vector3(gpu.domainCenterXZ.x, 0f, gpu.domainCenterXZ.y);
+        Vector3 off = new Vector3(gpu.DomainCenterXZ.x, 0f, gpu.DomainCenterXZ.y);
         Matrix4x4 simToWorld = gpu.transform.localToWorldMatrix * Matrix4x4.Scale(new Vector3(1f, 1f, -1f)) * Matrix4x4.Translate(-off);
         float rdm = L.RD > 0f ? L.RD : SprayCoarseRadius / 2.924f;
-        foreach (var o in gpu.obstacles)
+        foreach (var o in gpu.SceneObstacles)
         {
             if (o == null || o.transform == null || !o.transform.gameObject.activeInHierarchy) continue;
             Matrix4x4 toLocal = o.transform.worldToLocalMatrix * simToWorld;
@@ -107,10 +107,10 @@ public partial class FluidSceneMVP
         try
         {
             ApplyGpuSprayKnobs();
-            var s = gpuSprayProvider.Solver;
+            var s = gpuSprayProvider;
             gpuSprayCb.Clear();
             gpuSprayCb.BeginSample(SamplerSpray);
-            gpuSprayLayer.RecordStep(gpuSprayCb, s.PositionBuffer, s.VelocityBuffer, s.Count, SprayCoarseRadius);
+            gpuSprayLayer.RecordStep(gpuSprayCb, s.PositionBuffer, s.VelocityBuffer, s.GpuCount, SprayCoarseRadius);
             gpuSprayCb.EndSample(SamplerSpray);
             Graphics.ExecuteCommandBuffer(gpuSprayCb);
         }

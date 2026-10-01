@@ -1,0 +1,131 @@
+{
+    "Configuration": {
+        "DFSPH": {
+            "enableDivergenceSolver": true,
+            "maxError": 0.05000000074505806,
+            "maxErrorV": 0.10000000149011612,
+            "maxIterations": 100,
+            "maxIterationsV": 100,
+            "minIterations": 2
+        },
+        "boundaryHandlingMethod": 2,
+        "cflFactor": 1.0,
+        "cflMaxTimeStepSize": 0.004999999888241291,
+        "cflMethod": 1,
+        "cflMinTimeStepSize": 9.999999747378752e-05,
+        "dataExportFPS": 25.0,
+        "enableAsyncExport": false,
+        "enablePartioExport": true,
+        "enableRigidBodyExport": false,
+        "enableRigidBodyOBJExport": false,
+        "enableRigidBodyPLYExport": false,
+        "enableRigidBodyVTKExport": false,
+        "enableStateExport": false,
+        "enableVTKExport": false,
+        "enableZSort": true,
+        "gradKernel": 4,
+        "gravitation": [
+            0.1427,
+            -10.8482,
+            0.2978
+        ],
+        "kernel": 4,
+        "numberOfStepsPerRenderUpdate": 4,
+        "particleAttributes": "position;velocity;density",
+        "partioAttributes": "position;velocity;density",
+        "particleRadius": 0.042403249999999997,
+        "pause": true,
+        "pauseAt": -1.0,
+        "renderWalls": 4,
+        "simulationMethod": 4,
+        "stateExportFPS": 1.0,
+        "stepsPerZSort": 500,
+        "stopAt": 1.5,
+        "timeStepSize": 0.0015399523545056581
+    },
+    "FluidBlocks": [
+        {
+            "denseMode": 0,
+            "end": [
+                2.167235875,
+                1.6385358749999999,
+                2.740935875
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "start": [
+                0.70432375,
+                0.17562375,
+                1.27802375
+            ],
+            "translation": [
+                0.0,
+                0.0,
+                0.0
+            ]
+        }
+    ],
+    "Materials": [
+        {
+            "Standard viscosity": {
+                "viscosity": 0.009999999776482582,
+                "viscosityBoundary": 0.0
+            },
+            "XSPH": {
+                "xsph": 0.0,
+                "xsphBoundary": 0.0
+            },
+            "colorField": "velocity",
+            "colorMapType": 5,
+            "density0": 1000,
+            "dragMethod": 0,
+            "elasticityMethod": 0,
+            "id": "Fluid",
+            "renderMaxValue": 4.600371837615967,
+            "renderMinValue": 0.024852702394127846,
+            "surfaceTensionMethod": 0,
+            "viscosityMethod": 1,
+            "visible": true,
+            "vorticityMethod": 0
+        }
+    ],
+    "RigidBodies": [
+        {
+            "color": [
+                0.1,
+                0.4,
+                0.6,
+                1.0
+            ],
+            "geometryFile": "/home/matias/Desktop/SSU_restart/Assets/models/UnitBox.obj",
+            "isDynamic": false,
+            "isWall": true,
+            "mapInvert": true,
+            "mapResolution": [
+                30,
+                30,
+                30
+            ],
+            "mapThickness": 0.0,
+            "rotationAngle": 0,
+            "rotationAxis": [
+                1,
+                0,
+                0
+            ],
+            "scale": [
+                3,
+                3,
+                3
+            ],
+            "translation": [
+                1.5,
+                1.5,
+                1.5
+            ]
+        }
+    ]
+}

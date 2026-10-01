@@ -12,7 +12,7 @@ using System;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
-public class GpuSphProvider : ParticleFrameProvider
+public class GpuSphProvider : ParticleFrameProvider, IGpuSimSource
 {
     [Header("Compute")]
     [Tooltip("GpuSph.compute asset.")]
@@ -71,6 +71,18 @@ public class GpuSphProvider : ParticleFrameProvider
     int solverFrameIdx;
     public int ActiveParticles => solver != null ? solver.Count : 0;
     public GpuSphSolver Solver { get { EnsureInit(); return solver; } }
+
+    // IGpuSimSource (DFSPH1001): the GPU path / spray take either solver
+    public GraphicsBuffer PositionBuffer => Solver.PositionBuffer;
+    public GraphicsBuffer VelocityBuffer => Solver.VelocityBuffer;
+    public GraphicsBuffer DensityBuffer => Solver.DensityBuffer;
+    public int GpuCount => Solver.Count;
+    public float SimHz => simHz;
+    public Vector3 Gravity => gravity;
+    public Vector3 DomainMin => domainMin;
+    public Vector3 DomainMax => domainMax;
+    public Vector2 DomainCenterXZ => domainCenterXZ;
+    public LiveSphProvider.Obstacle[] SceneObstacles => obstacles;
 
     public override int FrameCount { get { EnsureInit(); return 1; } }
     public override float NativeFps => simHz;

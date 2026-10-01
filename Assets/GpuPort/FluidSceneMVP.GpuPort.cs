@@ -105,10 +105,9 @@ public partial class FluidSceneMVP
     /// <summary>The current particle frame as GPU buffers: the solver's own (no copy) or an upload of the CPU frame.</summary>
     void GpuParticles(out GraphicsBuffer pos, out GraphicsBuffer vel, out GraphicsBuffer dens, out int n)
     {
-        if (provider is GpuSphProvider g)
+        if (provider is IGpuSimSource g)   // GPU PBF or GPU DFSPH (DFSPH1001): the solver's own buffers, no copy
         {
-            var s = g.Solver;
-            pos = s.PositionBuffer; vel = s.VelocityBuffer; dens = s.DensityBuffer; n = s.Count;
+            pos = g.PositionBuffer; vel = g.VelocityBuffer; dens = g.DensityBuffer; n = g.GpuCount;
             return;
         }
         provider.GetFrame(frameIdx, out var data, out int off, out int count);

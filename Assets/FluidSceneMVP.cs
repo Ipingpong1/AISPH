@@ -966,7 +966,7 @@ public partial class FluidSceneMVP : MonoBehaviour
 
     // Sim time the foam advances on: the GPU solver's own clock when live (so the layer steps once per NEW
     // solver frame, whatever the render rate), else the playback clock.
-    float FoamClock => provider is GpuSphProvider gpu ? gpu.SolverTime : simTime;
+    float FoamClock => provider is IGpuSimSource gpu ? gpu.SolverTime : simTime;
 
     float FoamRadius => foamRadiusOverride > 0f ? foamRadiusOverride
         : provider.ParticleRadius > 0f ? provider.ParticleRadius
@@ -1053,7 +1053,8 @@ public partial class FluidSceneMVP : MonoBehaviour
         string live = provider is LiveSphProvider sph
             ? $"LIVE SPH {sph.ActiveParticles}p solver {sph.LastStepMs:F0}ms   "
             : provider is GpuSphProvider gpu
-                ? $"LIVE GPU-PBF {gpu.ActiveParticles}p solver {gpu.LastStepMs:F1}ms   " : "";
+                ? $"LIVE GPU-PBF {gpu.ActiveParticles}p solver {gpu.LastStepMs:F1}ms   "
+                : provider is DfsphProvider df ? df.StatusLine() : "";
         status = live + $"frame {frameIdx + 1}/{provider.FrameCount}   sim {playbackFps:F0} fps ×{speed:F1}   " +
                  $"render {smoothedFps:F1} fps   " +
                  (ActiveSpread > 0 ? $"infer spread/{ActiveSpread} {inferMs:F0} ms latency, fluid {fluidHz:F1} Hz   "
