@@ -135,7 +135,7 @@ public class DfsphSolver : IDisposable
     int n, cells, groups;
     Vector3Int gridDim;
     float h;
-    CommandBuffer stepCb;
+    CommandBuffer stepCb, bodyCb;
     bool stepCbDirty = true;
     CustomSampler sampler;
 
@@ -205,6 +205,7 @@ public class DfsphSolver : IDisposable
         bCellOf = bCellCount = bCellStart = bCellFill = bSorted = bState = bPartial = bArgs = bStats = bWT = bGT = null;
         bBodies = bNodes = bProbeIn = bProbeOut = null;
         stepCb?.Release(); stepCb = null;
+        bodyCb?.Release(); bodyCb = null;
         if (cs != null) { if (Application.isPlaying) UnityEngine.Object.Destroy(cs); else UnityEngine.Object.DestroyImmediate(cs); }
         cs = null;
     }
@@ -486,6 +487,23 @@ public class DfsphSolver : IDisposable
     /// <summary>Upload body poses / kinematic velocities (call after changing translation / rotation / velocities).</summary>
     public void UploadBodies()
     {
+        StageBodies();
+        bBodies.SetData(bodyStage);
+    }
+
+    /// <summary>UploadBodies through a command buffer, so the upload sits between ExecuteSteps calls on the GPU timeline
+    /// (per-step prop poses: upload, ExecuteSteps(1), upload, ...).</summary>
+    public void UploadBodiesOrdered()
+    {
+        StageBodies();
+        if (bodyCb == null) bodyCb = new CommandBuffer { name = "DFSPH1001.Bodies" };
+        bodyCb.Clear();
+        bodyCb.SetBufferData(bBodies, bodyStage);
+        Graphics.ExecuteCommandBuffer(bodyCb);
+    }
+
+    void StageBodies()
+    {
         for (int i = 0; i < MaxBodies; i++) bodyStage[i] = default;
         for (int i = 0; i < bodies.Count; i++)
         {
@@ -512,7 +530,6 @@ public class DfsphSolver : IDisposable
             }
             bodyStage[i] = g;
         }
-        bBodies.SetData(bodyStage);
     }
 
     // ---------- particles ----------

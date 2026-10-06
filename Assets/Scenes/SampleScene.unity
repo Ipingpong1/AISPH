@@ -471,6 +471,7 @@ GameObject:
   - component: {fileID: 336920068}
   - component: {fileID: 336920072}
   - component: {fileID: 336920071}
+  - component: {fileID: 336920073}
   m_Layer: 0
   m_Name: FluidLiveScene
   m_TagString: Untagged
@@ -490,9 +491,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 261b1b11823aa47ca912e15fa53e0a59, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::FluidSceneMVP
-  provider: {fileID: 336920072}
-  statsJson: {fileID: 4900000, guid: f59b2f8791586abd4ae5976ab3d31e03, type: 3}
-  modelAsset: {fileID: 5022602860645237092, guid: 932443ddbca95523b9863be539e82876, type: 3}
+  provider: {fileID: 336920073}
+  statsJson: {fileID: 4900000, guid: 339cfec9fed06bd6d9daadca649e4dfc, type: 3}
+  modelAsset: {fileID: 5022602860645237092, guid: 1f741e3be3f81dd74802da8acbcd8852, type: 3}
   sceneShader: {fileID: 0}
   smoothShader: {fileID: 0}
   targetCamera: {fileID: 330585545}
@@ -500,7 +501,7 @@ MonoBehaviour:
   playbackFps: 25
   speed: 1
   backend: 256
-  useFp16: 1
+  useFp16: 0
   spreadFrames: 0
   spreadFramesMobile: 3
   kThickOverride: 0.5
@@ -512,7 +513,7 @@ MonoBehaviour:
   v2ThicknessScale: 0
   focalMode: 1
   windowWidth: 512
-  presmoothSigma: 0
+  presmoothSigma: 1
   bilateralSmoothing: 0
   bilateralSigmaS: 1
   bilateralIters: 2
@@ -521,7 +522,7 @@ MonoBehaviour:
   ks: 0.7
   shininess: 120
   depthBias: 0
-  temporalMode: 0
+  temporalMode: 1
   temporalAlphaRest: 0.3
   temporalSpeedRamp: {x: 0.1, y: 0.5}
   temporalRejectM: 0.1
@@ -578,10 +579,61 @@ MonoBehaviour:
   lookSpeedDegPerPx: 0.15
   showRawInput: 0
   showStatus: 1
+  keyboardShortcuts: 1
   captureDir: 
   captureFps: 30
   captureSeconds: 16
   orbitPeriodSec: 16
+  gpuPath: 1
+  gpuSplatShader: {fileID: 0}
+  surfaceSource: 0
+  classicalSettings:
+    radiusMult: 3
+    repairSparseRadius: 1
+    repairSupportContinuity: 1
+    supportContinuityEndpoint: 12.5
+    sparseRadiusMult: 1.5
+    sparseNeighborsMin: 0
+    sparseNeighborsMax: 25
+    particleRadius: 0
+    kernelRatio: 8
+    positionBlending: 0.5
+    axisRatio: 8
+    neighborThreshold: 25
+    spraySize: 0.75
+    isoTol: 0.01
+    minRadiusPx: 1
+    maxRadiusPx: 96
+    sphereMaxRadiusPxPerK: 24
+    thicknessMode: 0
+    thicknessScaleGT: 15.851288
+    narrowRange: 1
+    nrFilterSize: 40
+    nrIters: 2
+    nrThresholdRatio: 20
+    nrClampRatio: 1
+    nrParticleRadius: 0.0414
+    nrUseParticleRadius: 0
+    nrMaxFilterSize: 100
+    nrCleanup: 1
+    nrCleanupRadiusPx: 4
+    depthOffset: 0.0038260221
+  classicalApplyPostFilters: 0
+  classicalApplyTemporal: 0
+  modelBankResources: SSU_ModelBank
+  sprayEnabled: 0
+  sprayModelResource: spray_emitter_L_s0
+  sprayModel: {fileID: 0}
+  sprayBackend: 256
+  sprayRateScale: 0.3
+  sprayLaunchSpeed: 3
+  sprayDropletRadius: 0
+  sprayMaxDroplets: 30000
+  sprayMinRadiusPx: 0.75
+  sprayRadiusScale: 1
+  spraySeed: 0
+  sprayRenderMode: 0
+  sprayAnalyticNormals: 1
 --- !u!4 &336920070
 Transform:
   m_ObjectHideFlags: 0
@@ -634,7 +686,7 @@ MonoBehaviour:
   particleRadius: 0.0414
   restDensity: 1000
   maxParticles: 7000
-  simHz: 25
+  simHz: 35
   domainMin: {x: 0, y: 0, z: 0}
   domainMax: {x: 3, y: 3, z: 3}
   domainCenterXZ: {x: 1.5, y: 1.5}
@@ -665,6 +717,51 @@ MonoBehaviour:
     orbitPeriod: 6
     motionAxis: {x: 1, y: 0, z: 0}
     motionDistance: 0.8
+--- !u!114 &336920073
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 336920067}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d00bbee4b80727fafb692c5ea353bd97, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::DfsphProvider
+  dfsphCompute: {fileID: 0}
+  scenePath: Assets/Dfsph/Scenes/tcv_pilot_0000.json
+  sceneAsset: {fileID: 0}
+  maxParticles: 65536
+  corpusTessellation: 1
+  simHz: 25
+  maxStepsPerFrame: 8
+  exactIterations: 0
+  liveCapPressure: 16
+  liveCapDivergence: 8
+  domainMin: {x: 0, y: 0, z: 0}
+  domainMax: {x: 3, y: 3, z: 3}
+  domainCenterXZ: {x: 1.5, y: 1.5}
+  obstacles:
+  - transform: {fileID: 1333028643}
+    shape: 0
+    motion: 0
+    orbit: 0
+    orbitRadius: 0.8
+    orbitPeriod: 6
+    motionAxis: {x: 1, y: 0, z: 0}
+    motionDistance: 0.8
+  - transform: {fileID: 42445202}
+    shape: 1
+    motion: 0
+    orbit: 0
+    orbitRadius: 0.8
+    orbitPeriod: 6
+    motionAxis: {x: 1, y: 0, z: 0}
+    motionDistance: 0.8
+  propMapResolution: {x: 20, y: 20, z: 20}
+  propMaxStepRadii: 0.5
+  divergenceResetSpeed: 60
 --- !u!1001 &409016884
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -1100,8 +1197,12 @@ MonoBehaviour:
     particleData: {fileID: 4900000, guid: 83196b2e7a8449eeae80df80603c7677, type: 3}
     metaJson: {fileID: 4900000, guid: 5d12893b8fb543a9b39bd32dea90e5fe, type: 3}
   modelAsset: {fileID: 5022602860645237092, guid: 66760c2de5905e3e7853822f73bff331, type: 3}
-  modelLabel: 058a raw (v2 input)
-  compareModels: []
+  modelLabel: THIN
+  compareModels:
+  - label: RS
+    model: {fileID: 5022602860645237092, guid: 47b2601bf287c9d018a69230289b457d, type: 3}
+  - label: GD
+    model: {fileID: 5022602860645237092, guid: 1f741e3be3f81dd74802da8acbcd8852, type: 3}
   ssfrShader: {fileID: 4800000, guid: e1e62df4560715f1390cbde41a0243cc, type: 3}
   splatMode: 0
   paritySlot: 0

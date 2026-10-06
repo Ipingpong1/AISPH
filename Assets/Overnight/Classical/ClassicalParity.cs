@@ -20,6 +20,9 @@ public static class ClassicalParity
         public int N, H, W;
         public float[] eye, right, up, fwd;
         public float focal, particleRadius, thicknessScale, kMult, depthOffset;
+        public bool repairSparseRadius, nrUseParticleRadius, repairSupportContinuity;
+        public float supportContinuityEndpoint;
+        public float sparseRadiusMult;
     }
 
     static float[] ReadF32(string path)
@@ -46,6 +49,11 @@ public static class ClassicalParity
         var cam = JsonUtility.FromJson<Cam>(File.ReadAllText(Path.Combine(dir, "camera.json")));
         var settings = new ClassicalSurfaceSettings { radiusMult = cam.kMult > 0f ? cam.kMult : 3f };
         if (cam.depthOffset != 0f) settings.depthOffset = cam.depthOffset;
+        settings.repairSparseRadius = cam.repairSparseRadius;
+        settings.repairSupportContinuity = cam.repairSupportContinuity;
+        if (cam.supportContinuityEndpoint > 0f) settings.supportContinuityEndpoint = cam.supportContinuityEndpoint;
+        settings.nrUseParticleRadius = cam.nrUseParticleRadius;
+        if (cam.sparseRadiusMult > 0f) settings.sparseRadiusMult = cam.sparseRadiusMult;
         var cs = new ClassicalSurface(settings);
         try
         {
@@ -82,7 +90,16 @@ public static class ClassicalParity
                 var kern = new float[n * 24];
                 cs.ReadKernels(kern);
                 WriteF32(Path.Combine(dir, "u_kern.bin"), kern, n * 24);
+                var support = new float[n * 2];
+                cs.ReadKernelSupport(support);
+                WriteF32(Path.Combine(dir, "u_support.bin"), support, n * 2);
             }
+            var projected = new float[n * 16];
+            cs.ReadProjected(projected);
+            WriteF32(Path.Combine(dir, "u_projected.bin"), projected, n * 16);
+            var radii = new float[n];
+            for (int i = 0; i < n; i++) radii[i] = settings.radiusMult * projected[i * 16 + 15];
+            WriteF32(Path.Combine(dir, "u_radius_mult.bin"), radii, n);
             // the shading field itself (texture layout), to prove the Pack flip + offset
             var tex = new Texture2D(W, H, TextureFormat.RGBAFloat, false);
             var prev = RenderTexture.active;

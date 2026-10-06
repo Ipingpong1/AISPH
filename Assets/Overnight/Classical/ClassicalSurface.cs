@@ -25,6 +25,14 @@ public class ClassicalSurfaceSettings
 {
     [Tooltip("Sprite radius multiplier k (ellipsoids drawn at k * r). 3.0 = the PBF-suite C* selection (SSU_restart Experiments/T123_probe/coverage_probe_pbf.json selected.t3_aniso.k; T&Y's own default is 1.5).")]
     public float radiusMult = 3f;
+    [Tooltip("Opt-in sparse-support experiment. Off preserves the frozen classical renderer. On interpolates sparseRadiusMult to radiusMult over the neighbor-count range, leaving dense particles unchanged.")]
+    public bool repairSparseRadius = false;
+    [Tooltip("Opt-in support continuity: smooth weighted-support radius, determinant-one shape, and center. Takes precedence over count-based sparse radius. Off preserves the frozen renderer; no temporal history is used.")]
+    public bool repairSupportContinuity = false;
+    [Tooltip("Weighted-neighbor support at the dense endpoint. 12.5 = 25 nominal neighbors times mean cubic weight 1/2 in a uniform 3D ball. Dense endpoints retain the original kernel and center.")]
+    public float supportContinuityEndpoint = 12.5f;
+    public float sparseRadiusMult = 1.5f;
+    public int sparseNeighborsMin = 0, sparseNeighborsMax = 25;
     [Tooltip("Particle radius r [sim m] for the kernels and sprites. 0 = the live splat radius (provider.ParticleRadius, GpuSphProvider 0.0414).")]
     public float particleRadius = 0f;
     [Tooltip("Kernel support h = kernelRatio * r (Banana AniKernelGenerator: 8).")]
@@ -60,6 +68,8 @@ public class ClassicalSurfaceSettings
     public float nrClampRatio = 1f;
     [Tooltip("NR particle radius [m]. 0.0414 = the recon_narrow_range_faithful default, which is what the research row used (coverage_probe.nr() never passes it).")]
     public float nrParticleRadius = 0.0414f;
+    [Tooltip("Use the actual current particle radius for narrow-range filtering. Off preserves the historical fixed-radius baseline.")]
+    public bool nrUseParticleRadius = false;
     [Tooltip("NR projected-radius cap in px (MAX_FILTER_SIZE 100).")]
     public int nrMaxFilterSize = 100;
     [Tooltip("NR fixed-radius 2D clean-up pass (T&Y's '+1' iteration).")]
@@ -77,7 +87,7 @@ public sealed class ClassicalSurface : IDisposable
     readonly ComputeShader cs;
     readonly int kAniso, kProject, kClear, kRaster, kResolve, kNR1D, kNR2D, kPack;
 
-    ComputeBuffer posBuf, cellStartBuf, cellCountBuf, cellIdxBuf, cellOfBuf, kernBuf, projBuf;
+    ComputeBuffer posBuf, cellStartBuf, cellCountBuf, cellIdxBuf, cellOfBuf, kernBuf, projBuf, supportBuf;
     ComputeBuffer keyBuf, thickFixBuf, backKeyBuf, splatBuf, maskBuf, thickBuf, dA, dB, shadeDepthBuf;
     RenderTexture outRT;
     int capN, capCells, H, W, count;
@@ -118,11 +128,12 @@ public sealed class ClassicalSurface : IDisposable
     {
         if (n <= capN && posBuf != null) return;
         int cap = Math.Max(1024, Mathf.NextPowerOfTwo(n));
-        posBuf?.Release(); kernBuf?.Release(); projBuf?.Release(); cellIdxBuf?.Release(); cellOfBuf?.Release();
+        posBuf?.Release(); kernBuf?.Release(); projBuf?.Release(); supportBuf?.Release(); cellIdxBuf?.Release(); cellOfBuf?.Release();
         posBuf = new ComputeBuffer(cap * 3, 4);
         cellOfBuf = new ComputeBuffer(cap, 4);
         kernBuf = new ComputeBuffer(cap * KSTRIDE, 4);
         projBuf = new ComputeBuffer(cap * PSTRIDE, 4);
+        supportBuf = new ComputeBuffer(cap * 2, 4);
         cellIdxBuf = new ComputeBuffer(cap, 4);
         posStage = new float[cap * 3];
         cellIdx = new uint[cap];
@@ -156,9 +167,9 @@ public sealed class ClassicalSurface : IDisposable
     public void Dispose()
     {
         ReleaseImage();
-        posBuf?.Release(); kernBuf?.Release(); projBuf?.Release(); cellIdxBuf?.Release(); cellOfBuf?.Release();
+        posBuf?.Release(); kernBuf?.Release(); projBuf?.Release(); supportBuf?.Release(); cellIdxBuf?.Release(); cellOfBuf?.Release();
         cellStartBuf?.Release(); cellCountBuf?.Release();
-        posBuf = kernBuf = projBuf = cellIdxBuf = cellOfBuf = cellStartBuf = cellCountBuf = null;
+        posBuf = kernBuf = projBuf = supportBuf = cellIdxBuf = cellOfBuf = cellStartBuf = cellCountBuf = null;
         capN = 0; capCells = 0;
     }
 
@@ -199,6 +210,7 @@ public sealed class ClassicalSurface : IDisposable
         count = n;
         EnsureParticles(n);
         var rec = new float[n * KSTRIDE];
+        var support = new float[n * 2];
         for (int i = 0; i < n; i++)
         {
             int a = i * 12, b = i * KSTRIDE;
@@ -212,9 +224,11 @@ public sealed class ClassicalSurface : IDisposable
             float l1 = Mathf.Sqrt(K[0, 1] * K[0, 1] + K[1, 1] * K[1, 1] + K[2, 1] * K[2, 1]);
             float l2 = Mathf.Sqrt(K[0, 2] * K[0, 2] + K[1, 2] * K[1, 2] + K[2, 2] * K[2, 2]);
             bool iso = Mathf.Abs(l0 - l1) < s.isoTol && Mathf.Abs(l1 - l2) < s.isoTol && Mathf.Abs(l2 - l0) < s.isoTol;
-            rec[b + 21] = -1f; rec[b + 22] = iso ? 1f : 0f; rec[b + 23] = 0f;
+            rec[b + 21] = -1f; rec[b + 22] = !s.repairSupportContinuity && iso ? 1f : 0f; rec[b + 23] = 0f;
+            support[2 * i + 1] = 1f; // injected kernels retain their prescribed shape and radius
         }
         kernBuf.SetData(rec, 0, 0, rec.Length);
+        supportBuf.SetData(support, 0, 0, support.Length);
         Render(eye, right, up, fwd, focal, s.particleRadius > 0f ? s.particleRadius : r, thicknessScale);
     }
 
@@ -284,6 +298,9 @@ public sealed class ClassicalSurface : IDisposable
         cs.SetInt("_NbrThreshold", s.neighborThreshold);
         cs.SetFloat("_SpraySize", s.spraySize);
         cs.SetFloat("_IsoTol", s.isoTol);
+        cs.SetInt("_SupportContinuity", s.repairSupportContinuity ? 1 : 0);
+        cs.SetFloat("_SupportEndpoint", Mathf.Max(s.supportContinuityEndpoint, 1e-4f));
+        cs.SetBuffer(kAniso, "_Support", supportBuf);
         cs.SetBuffer(kAniso, "_Pos", posBuf);
         cs.SetBuffer(kAniso, "_CellStart", cellStartBuf);
         cs.SetBuffer(kAniso, "_CellCount", cellCountBuf);
@@ -304,6 +321,11 @@ public sealed class ClassicalSurface : IDisposable
         cs.SetFloat("_Focal", focal);
         cs.SetFloat("_Ppu", (float)ppu);
         cs.SetFloat("_Aspect", (float)((double)W / H));
+        cs.SetInt("_RepairSparseRadius", s.repairSparseRadius ? 1 : 0);
+        cs.SetInt("_SupportContinuity", s.repairSupportContinuity ? 1 : 0);
+        cs.SetFloat("_SparseRadiusRatio", Mathf.Max(s.sparseRadiusMult, 1e-4f) / Mathf.Max(s.radiusMult, 1e-4f));
+        cs.SetFloat("_SparseNeighborsMin", s.sparseNeighborsMin);
+        cs.SetFloat("_SparseNeighborsMax", Math.Max(s.sparseNeighborsMax, s.sparseNeighborsMin + 1));
         cs.SetFloat("_Rho", (float)rho);
         cs.SetFloat("_Rho2", (float)(rho * rho));
         cs.SetFloat("_RhoPpu", (float)(rho * ppu));
@@ -324,6 +346,7 @@ public sealed class ClassicalSurface : IDisposable
         if (n > 0)
         {
             cs.SetBuffer(kProject, "_Kern", kernBuf);
+            cs.SetBuffer(kProject, "_Support", supportBuf);
             cs.SetBuffer(kProject, "_Proj", projBuf);
             cs.Dispatch(kProject, (n + 63) / 64, 1, 1);
 
@@ -348,7 +371,7 @@ public sealed class ClassicalSurface : IDisposable
         if (s.narrowRange && s.nrFilterSize > 0)
         {
             double fpx = focal * (H / 2.0);     // = H / (2 tan(fov/2)) for this window's vertical fov
-            double nrR = s.nrParticleRadius;
+            double nrR = s.nrUseParticleRadius ? r : s.nrParticleRadius;
             cs.SetFloat("_NRK", (float)(s.nrFilterSize * fpx * nrR * 0.1));
             cs.SetInt("_NRMaxR", s.nrMaxFilterSize);
             cs.SetFloat("_Delta", (float)(s.nrThresholdRatio * nrR));
@@ -397,6 +420,12 @@ public sealed class ClassicalSurface : IDisposable
     public void ReadFinalDepth(float[] depth) => finalDepth.GetData(depth, 0, 0, H * W);
 
     public void ReadKernels(float[] dst) => kernBuf.GetData(dst, 0, 0, count * KSTRIDE);
+
+    /// <summary>Debug weighted support and smooth confidence, two floats per particle.</summary>
+    public void ReadKernelSupport(float[] dst) => supportBuf.GetData(dst, 0, 0, count * 2);
+
+    /// <summary>Debug projected records; slot 15 is radius divided by the bulk radius (0 when centre-culled).</summary>
+    public void ReadProjected(float[] dst) => projBuf.GetData(dst, 0, 0, count * PSTRIDE);
 
     /// <summary>The depth handed to the shading (after NR and the offset), tensor layout, 0 = no fluid. Synchronous.</summary>
     public void ReadShadedDepth(float[] depth) => shadeDepthBuf.GetData(depth, 0, 0, H * W);

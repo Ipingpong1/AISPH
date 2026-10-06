@@ -12,7 +12,7 @@
 // Double-filtering policy (classicalApplyPostFilters = false, the default): presmooth, bilateral and the temporal
 //   EMA are BYPASSED in classical mode — the research row has none of them and the NR filter is its smoothing. The
 //   network's own "+s2" row corresponds to presmoothSigma 2, which classical mode deliberately does not get.
-//   With classicalApplyPostFilters on, presmooth / bilateral are applied like the network path; temporal stays off.
+//   With classicalApplyPostFilters on, presmooth / bilateral are applied like the network path; temporal is controlled separately.
 // kThick (Beer-Lambert scale): kThickOverride if set (SampleScene: 0.5); else the network's locked value (one shared
 //   material); else derived from the classical thickness with the network path's own rule (1.2 / median, same lock).
 //   Classical thickness (shading only; the research row scores depth + mask) = path length through the ellipsoids x
@@ -20,7 +20,7 @@
 // Foam (G / FoamLayer): works in both modes; in classical mode its fluid depth is an async readback (one frame late).
 // Learned spray (G2, key J): if present and on, the classical field is read back into the CPU field so the spray
 //   layer composites its droplets exactly as it does for the network (found by reflection: no compile-time coupling).
-// Not in classical mode: V (raw input), the temporal stage, OnInferred / LastPred taps (LiveClipRecorder).
+// Not in classical mode: V (raw input), OnInferred / LastPred taps (LiveClipRecorder).
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -34,8 +34,13 @@ public partial class FluidSceneMVP
     public SurfaceSource surfaceSource = SurfaceSource.Network;
     [Tooltip("Classical C* parameters: the frozen PBF-suite values (sources: SSU_restart Experiments/Overnight0930/G3_classical/NOTES.md).")]
     public ClassicalSurfaceSettings classicalSettings = new ClassicalSurfaceSettings();
-    [Tooltip("Off (default): classical depth reaches the shading as the research row defines it (no presmooth / bilateral / temporal on top of the NR filter). On: the network path's presmooth / bilateral settings are applied on top (temporal stays off).")]
+    [Tooltip("Off (default): classical depth reaches the shading as the research row defines it (no presmooth / bilateral / temporal on top of the NR filter). On: the network path's presmooth / bilateral settings are applied on top (temporal is controlled separately).")]
     public bool classicalApplyPostFilters = false;
+    [Tooltip("Opt-in shared adaptive temporal stage. Set Temporal Mode to Adaptive before starting. Uses the SAME input velocity splat as the network; adds CPU splat/upload cost. Off preserves the classical baseline.")]
+    public bool classicalApplyTemporal = false;
+    Texture2D classicalSpeedTex;
+    Color[] classicalSpeedPixels;
+    int classicalTemporalFrame = -1;
 
     ClassicalSurface classical;
     float[] classicalDepthCpu, classicalAuxCpu, classicalAux2Cpu;
@@ -133,16 +138,18 @@ public partial class FluidSceneMVP
             if (!smoothedRT.IsCreated()) smoothedRT.Create();
             Graphics.CopyTexture(field, smoothedRT);   // bit-exact: no presmooth / bilateral
         }
-        hasHistory = false;            // temporal bypassed; never blend a network history into classical frames
+        bool applyTemporal = classicalApplyTemporal && temporalMat != null;
+        if (provider.FrameCount > 1 && frameIdx < classicalTemporalFrame) hasHistory = false;
+        classicalTemporalFrame = frameIdx;
+        RenderTexture shadeSource = ApplyTemporalField(applyTemporal ? ClassicalInputSpeed() : field, applyTemporal);
 
         // same material for both sources (kThick policy in the header)
         float kNet = kThick;
         kThick = ClassicalKThick();
         SetShadeParams(shadeMat);
-        Graphics.Blit(smoothedRT, cRT, shadeMat, 0);
-        Graphics.Blit(smoothedRT, mRT, shadeMat, 1);
-        Graphics.Blit(smoothedRT, nRT, shadeMat, 2);
-        TemporalIn = TemporalHist = TemporalOut = null;
+        Graphics.Blit(shadeSource, cRT, shadeMat, 0);
+        Graphics.Blit(shadeSource, mRT, shadeMat, 1);
+        Graphics.Blit(shadeSource, nRT, shadeMat, 2);
         OnShaded?.Invoke();
 
         compositeMat.SetTexture("_CTex", cRT);
@@ -161,6 +168,37 @@ public partial class FluidSceneMVP
         classicalMs = classicalMs <= 0f ? ms : Mathf.Lerp(classicalMs, ms, 0.1f);
         DrawFoam();
         quadMR.enabled = true;
+    }
+
+    // Reuse the network's complete input splat, including its footprint and velocity
+    // normalization. The classical surface can extend beyond it; speed is then zero,
+    // exactly as for the network. This is an opt-in reference path, not a GPU optimization.
+    Texture ClassicalInputSpeed()
+    {
+        SplatToInput(frameIdx);
+        if (classicalSpeedTex == null || classicalSpeedTex.width != W || classicalSpeedTex.height != H)
+        {
+            if (classicalSpeedTex != null) Destroy(classicalSpeedTex);
+            classicalSpeedTex = new Texture2D(W, H, TextureFormat.RGBAFloat, false)
+                { filterMode = FilterMode.Point, wrapMode = TextureWrapMode.Clamp };
+            classicalSpeedPixels = new Color[H * W];
+        }
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+        {
+            int i = y * W + x;
+            float speed = 0f;
+            if (in7[6 * HW + i] > 0f)
+            {
+                float vx = in7[2 * HW + i] * meta.std[2] + meta.mean[2];
+                float vy = in7[3 * HW + i] * meta.std[3] + meta.mean[3];
+                float vz = in7[4 * HW + i] * meta.std[4] + meta.mean[4];
+                speed = Mathf.Sqrt(vx * vx + vy * vy + vz * vz);
+            }
+            classicalSpeedPixels[(H - 1 - y) * W + x] = new Color(0f, 0f, 0f, speed);
+        }
+        classicalSpeedTex.SetPixels(classicalSpeedPixels);
+        classicalSpeedTex.Apply(false, false);
+        return classicalSpeedTex;
     }
 
     // G2's learned spray is looked up by reflection so this file never depends on G2's (separately committed) code
@@ -245,5 +283,9 @@ public partial class FluidSceneMVP
         classical = null;
         if (classicalReadTex != null) Destroy(classicalReadTex);
         classicalReadTex = null;
+        if (classicalSpeedTex != null) Destroy(classicalSpeedTex);
+        classicalSpeedTex = null;
+        classicalSpeedPixels = null;
+        classicalTemporalFrame = -1;
     }
 }

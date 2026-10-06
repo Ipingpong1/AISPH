@@ -1,0 +1,20 @@
+{
+  "Configuration": {
+    "particleRadius": 0.035,
+    "gravitation": [0, -6.5, 0],
+    "simulationMethod": 4,
+    "boundaryHandlingMethod": 2,
+    "kernel": 4,
+    "gradKernel": 4,
+    "timeStepSize": 0.002,
+    "cflMethod": 1,
+    "cflFactor": 1.0,
+    "cflMinTimeStepSize": 0.0001,
+    "cflMaxTimeStepSize": 0.005,
+    "dataExportFPS": 25,
+    "DFSPH": { "enableDivergenceSolver": true, "maxError": 0.05, "maxErrorV": 0.1, "minIterations": 2, "maxIterations": 100, "maxIterationsV": 100 }
+  },
+  "FluidBlocks": [{ "start": [0.12, 1.80, 0.94], "end": [1.04, 2.72, 2.06], "denseMode": 0, "initialVelocity": [0,0,0] }],
+  "Materials": [{ "id": "Fluid", "density0": 1000, "viscosityMethod": 1, "Standard viscosity": { "viscosity": 0.01, "viscosityBoundary": 0 }, "surfaceTensionMethod": 0 }],
+  "RigidBodies": [{ "geometryFile": "UnitBox.obj", "isDynamic": false, "isWall": true, "mapInvert": true, "scale": [3,3,3], "translation": [1.5,1.5,1.5], "mapResolution": [30,30,30] }]
+}

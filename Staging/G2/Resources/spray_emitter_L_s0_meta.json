@@ -1,0 +1,47 @@
+{
+ "ckpt": "/home/matias/Desktop/SSU_restart/Experiments/4e/emitter/emitter_s0.pt",
+ "ckpt_sha256": "a21093b95e5dc04c9b3a09b43de9183272d887774188e83983944b738482b042",
+ "onnx": "/home/matias/AISPH/Staging/G2/Resources/spray_emitter_L_s0.onnx",
+ "onnx_sha256": "9a310661975aa4296c413ccb8284514e6a6e6f2d195bd7f07f70150f62e6e6b5",
+ "n_feat": 124,
+ "pack": [
+  [
+   "log_rate",
+   1
+  ],
+  [
+   "logits",
+   4
+  ],
+  [
+   "mu",
+   24
+  ],
+  [
+   "ls",
+   24
+  ],
+  [
+   "size",
+   10
+  ]
+ ],
+ "n_pack": 63,
+ "opset": 17,
+ "rows_checked": 21952,
+ "max_abs_diff_onnx_vs_torch": {
+  "log_rate": 1.1444091796875e-05,
+  "logits": 4.0531158447265625e-06,
+  "mu": 5.245208740234375e-06,
+  "ls": 5.0067901611328125e-06,
+  "size": 8.58306884765625e-06,
+  "packed": 1.1444091796875e-05,
+  "packed_batch1000_vs_full": 0.0
+ },
+ "pass": true,
+ "log_rate_bias": -3.0138628482818604,
+ "epoch": 6,
+ "seed": 0,
+ "sig_in": 0.08748386701656483,
+ "sig_in_source": "/home/matias/Desktop/SSU_restart/Experiments/4e/emitter/consts.json"
+}

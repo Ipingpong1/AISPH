@@ -266,6 +266,8 @@ public partial class FluidSceneMVP : MonoBehaviour
     public bool showRawInput = false;
     [Tooltip("Draw the status line (frame, fps, inference ms).")]
     public bool showStatus = true;
+    [Tooltip("Enable the research viewer's keyboard shortcuts. Turn off when a game controller owns input.")]
+    public bool keyboardShortcuts = true;
 
     [Header("Deterministic capture (fixed-step world-space orbit -> PNG per frame)")]
     [Tooltip("If non-empty, Play runs a fixed-step orbit of the target camera around the fluid anchor and writes one PNG per frame here (project-relative; encode with ffmpeg). Starts once kThick has locked so brightness is constant. Empty = normal interactive mode.")]
@@ -383,6 +385,8 @@ public partial class FluidSceneMVP : MonoBehaviour
     public class ClipSettings
     {
         public string splatMode, focalMode, model, stats, backend;
+        public string surfaceSource, classicalSettingsJson;
+        public bool classicalApplyPostFilters, classicalApplyTemporal;
         public bool fp16Active, thicknessCountNormalize;
         public float v2R, v2TS, v2MinR, v2MaxR, thickScale, refLrParticleRadius, presmoothSigma, depthBias, simScale, kThick;
         public float[] mean, std, target, simOffset;
@@ -394,6 +398,8 @@ public partial class FluidSceneMVP : MonoBehaviour
     public ClipSettings GetClipSettings() => new ClipSettings
     {
         splatMode = splatMode.ToString(), focalMode = focalMode.ToString(),
+        surfaceSource = surfaceSource.ToString(), classicalSettingsJson = JsonUtility.ToJson(classicalSettings),
+        classicalApplyPostFilters = classicalApplyPostFilters, classicalApplyTemporal = classicalApplyTemporal,
         model = modelAsset != null ? modelAsset.name : "", stats = statsJson != null ? statsJson.name : "",
         backend = backend.ToString(), fp16Active = fp16Active, thicknessCountNormalize = thicknessCountNormalize,
         v2R = v2R, v2TS = v2TS, v2MinR = v2MinR, v2MaxR = v2MaxR, thickScale = thickScale,
@@ -423,8 +429,24 @@ public partial class FluidSceneMVP : MonoBehaviour
         meta = JsonUtility.FromJson<Meta>(stats.text);
         if (meta.mean == null || meta.mean.Length < 6 || meta.std == null || meta.std.Length < 6)
             throw new Exception($"FluidSceneMVP: {stats.name} has no mean/std normalization stats");
-        simOffset = centerXZOnTarget && meta.target != null && meta.target.Length >= 3
-            ? new Vector3(meta.target[0], 0f, meta.target[2]) : Vector3.zero;
+        bool hasTarget = meta.target != null && meta.target.Length >= 3;
+        simOffset = centerXZOnTarget && hasTarget ? new Vector3(meta.target[0], 0f, meta.target[2]) : Vector3.zero;
+        // A live solver maps its props (and the GPU spray) with its own domainCenterXZ: render with the same centre, or the
+        // colliders sit 1.5 m away from the props you see whenever the stats JSON has no 'target' (the model-bank stats don't).
+        Vector2? liveCenter = provider is IGpuSimSource gs ? gs.DomainCenterXZ
+                            : provider is LiveSphProvider ls ? ls.domainCenterXZ : (Vector2?)null;
+        if (liveCenter.HasValue)
+        {
+            var c = new Vector3(liveCenter.Value.x, 0f, liveCenter.Value.y);
+            if (centerXZOnTarget)
+            {
+                if (hasTarget && (c - simOffset).sqrMagnitude > 1e-8f)
+                    Debug.LogWarning($"FluidSceneMVP: stats target xz ({simOffset.x}, {simOffset.z}) != provider domainCenterXZ ({c.x}, {c.z}); using the provider's so props line up");
+                simOffset = c;
+            }
+            else if (c.sqrMagnitude > 0f)
+                Debug.LogWarning("FluidSceneMVP: centerXZOnTarget is off but the provider's domainCenterXZ is not zero — props will not line up with the fluid");
+        }
 
         if (targetCamera == null) targetCamera = Camera.main;
         if (targetCamera == null) throw new Exception("FluidSceneMVP: no target camera (assign one or tag a camera MainCamera)");
@@ -762,7 +784,7 @@ public partial class FluidSceneMVP : MonoBehaviour
 
     void Update()
     {
-        if (ready) HandleInput();
+        if (ready && keyboardShortcuts) HandleInput();
     }
 
     void LateUpdate()   // after any camera controllers have moved the camera this frame
@@ -899,22 +921,15 @@ public partial class FluidSceneMVP : MonoBehaviour
 
     // Everything downstream of the (depth, thickness, alpha, speed) field: smoothing, temporal, the 512² shading packs,
     // the composite parameters and the foam layer. Shared by the CPU path (fieldTex) and the GPU1001 path (its field RT).
-    void ShadeField(Texture field)
+    SurfaceSource temporalHistorySource;
+    RenderTexture ApplyTemporalField(Texture field, bool enabled)
     {
-        // smoothing chain (FluidSSFR pass 0, unchanged semantics)
-        smoothMat.SetFloat("_BlurSigma", bilateralSmoothing ? bilateralSigmaS : presmoothSigma);
-        smoothMat.SetFloat("_BilateralRangeSigma", bilateralSmoothing ? bilateralSigmaR : 0f);
-        Graphics.Blit(field, smoothedRT, smoothMat, 0);
-        if (bilateralSmoothing)
-            for (int it = 1; it < bilateralIters; it++)
-            {
-                Graphics.Blit(smoothedRT, smoothedRT2, smoothMat, 0);
-                (smoothedRT, smoothedRT2) = (smoothedRT2, smoothedRT);
-            }
-
-        // temporal stage (067-EMA3): reprojected, motion-adaptive EMA + mask hysteresis. Off = the shading reads smoothedRT as before.
+        TemporalIn = TemporalHist = TemporalOut = null;
+        if (temporalHistorySource != surfaceSource) hasHistory = false;
+        temporalHistorySource = surfaceSource;
+        if (!enabled) hasHistory = false;
         RenderTexture shadeSrc = smoothedRT;
-        if (temporalMat != null)
+        if (enabled && temporalMat != null)
         {
             temporalMat.SetTexture("_FieldTex", field);
             temporalMat.SetTexture("_HistTex", histB);
@@ -937,6 +952,23 @@ public partial class FluidSceneMVP : MonoBehaviour
             hasHistory = true;
             eyePrev = eyeSim; rightPrev = rightSim; upPrev = upSim; fwdPrev = fwdSim; focalPrev = focalM;
         }
+        return shadeSrc;
+    }
+
+    void ShadeField(Texture field)
+    {
+        // smoothing chain (FluidSSFR pass 0, unchanged semantics)
+        smoothMat.SetFloat("_BlurSigma", bilateralSmoothing ? bilateralSigmaS : presmoothSigma);
+        smoothMat.SetFloat("_BilateralRangeSigma", bilateralSmoothing ? bilateralSigmaR : 0f);
+        Graphics.Blit(field, smoothedRT, smoothMat, 0);
+        if (bilateralSmoothing)
+            for (int it = 1; it < bilateralIters; it++)
+            {
+                Graphics.Blit(smoothedRT, smoothedRT2, smoothMat, 0);
+                (smoothedRT, smoothedRT2) = (smoothedRT2, smoothedRT);
+            }
+
+        RenderTexture shadeSrc = ApplyTemporalField(field, temporalMat != null);
 
         // scene-independent shading packs at 512² (premultiplied by coverage)
         SetShadeParams(shadeMat);

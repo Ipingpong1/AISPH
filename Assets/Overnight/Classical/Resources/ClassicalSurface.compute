@@ -30,6 +30,9 @@ int _N;
 StructuredBuffer<float> _Pos;            // 3 N (sim space)
 RWStructuredBuffer<float> _Kern;         // KSTRIDE N
 RWStructuredBuffer<float> _Proj;         // PSTRIDE N
+RWStructuredBuffer<float> _Support;      // 2 N: weighted neighbor support, smooth confidence
+int _SupportContinuity;                  // optional stateless support transition, off by default
+float _SupportEndpoint;
 
 // ------------------------------------------------------------------ Aniso
 StructuredBuffer<uint> _CellStart;
@@ -110,6 +113,13 @@ void Aniso(uint3 id : SV_DispatchThreadID)
     }
     float3 mrel = swd / (1.0 + sw);              // m_i - x_i
     float3 centre = xi + _Lambda * mrel;         // lerp(x_i, m_i, lambda)
+    float supportT = saturate(sw / _SupportEndpoint);
+    float confidence = supportT * supportT * (3.0 - 2.0 * supportT);
+    _Support[2 * i] = sw;
+    _Support[2 * i + 1] = confidence;
+    // Keep the original center exactly at the dense endpoint.
+    if (_SupportContinuity != 0 && confidence < 1.0)
+        centre = xi + confidence * (centre - xi);
 
     // pass 2: covariance about m_i over the SAME neighbour list, weights re-evaluated from m_i
     float c00 = 0, c01 = 0, c02 = 0, c11 = 0, c12 = 0, c22 = 0, sw2 = 0;
@@ -168,9 +178,11 @@ void Aniso(uint3 id : SV_DispatchThreadID)
     float3 q1 = float3(V[0][o1], V[1][o1], V[2][o1]);
     float3 q2 = float3(V[0][o2], V[1][o2], V[2][o2]);
     float K[9], Ki[9];
-    if (spray)
+    bool identityTransition = _SupportContinuity != 0 && (!ok || confidence <= 0.0);
+    if (identityTransition || (_SupportContinuity == 0 && spray))
     {
-        float ss = _SpraySize, si = 1.0 / (_SpraySize * _SpraySize);
+        float ss = identityTransition ? 1.0 : _SpraySize;
+        float si = 1.0 / (ss * ss);
         K[0] = ss; K[1] = 0; K[2] = 0; K[3] = 0; K[4] = ss; K[5] = 0; K[6] = 0; K[7] = 0; K[8] = ss;
         Ki[0] = si; Ki[1] = 0; Ki[2] = 0; Ki[3] = 0; Ki[4] = si; Ki[5] = 0; Ki[6] = 0; Ki[7] = 0; Ki[8] = si;
     }
@@ -178,6 +190,14 @@ void Aniso(uint3 id : SV_DispatchThreadID)
     {
         float g = exp2(log2(prod) * (-1.0 / 3.0));     // cbrt(1 / prod): det K = 1
         float ka = S0 * g, kb = S1 * g, kc = S2 * g;
+        // Log-Euclidean interpolation I -> K_dense, preserving the eigenvectors.
+        // Skip exponentiation at confidence one for the unchanged dense endpoint.
+        if (_SupportContinuity != 0 && confidence < 1.0)
+        {
+            ka = exp2(log2(ka) * confidence);
+            kb = exp2(log2(kb) * confidence);
+            kc = exp2(log2(kc) * confidence);
+        }
         float ia = 1.0 / (ka * ka), ib = 1.0 / (kb * kb), ic = 1.0 / (kc * kc);
         [unroll] for (int r = 0; r < 3; r++)
         [unroll] for (int cl = 0; cl < 3; cl++)
@@ -192,6 +212,9 @@ void Aniso(uint3 id : SV_DispatchThreadID)
     float l1 = sqrt(K[1] * K[1] + K[4] * K[4] + K[7] * K[7]);
     float l2 = sqrt(K[2] * K[2] + K[5] * K[5] + K[8] * K[8]);
     bool iso = abs(l0 - l1) < _IsoTol && abs(l1 - l2) < _IsoTol && abs(l2 - l0) < _IsoTol;
+    // Column lengths can agree for rotated anisotropic kernels. Continuous mode
+    // always intersects the actual quadric, including identity spheres.
+    if (_SupportContinuity != 0) iso = false;
 
     int b = i * KSTRIDE;
     _Kern[b + 0] = centre.x; _Kern[b + 1] = centre.y; _Kern[b + 2] = centre.z;
@@ -211,6 +234,8 @@ float _Rho;            // sprite radius k * r
 float _Rho2;           // rho^2 (double on the CPU -> float, like Python's float(radius) ** 2)
 float _RhoPpu;         // rho * ppu (double on the CPU -> float, like Python's radius * ppu)
 float _MinRpx, _MaxRpx, _SphMaxRpx;
+int _RepairSparseRadius;
+float _SparseRadiusRatio, _SparseNeighborsMin, _SparseNeighborsMax;
 
 [numthreads(64, 1, 1)]
 void Project(uint3 id : SV_DispatchThreadID)
@@ -223,18 +248,31 @@ void Project(uint3 id : SV_DispatchThreadID)
     float camx = dot(rel, _Right), camy = dot(rel, _Up);
     float dc = dot(rel, _Fwd);                                   // = -cam.z
     _Proj[o + 13] = 0.0;
+    _Proj[o + 15] = 0.0;
     if (!(dc > 1e-3)) return;
     float pxf = (_Focal * camx / dc / _Aspect + 1.0) * 0.5 * _Wpx;
     float pyf = (1.0 - _Focal * camy / dc) * 0.5 * _Hpx;
     bool iso = _Kern[b + 22] > 0.5;
+    float radiusRatio = 1.0;
+    // Injected known-answer kernels carry n=-1 and keep their prescribed radius.
+    if (_SupportContinuity != 0 && _Kern[b + 21] >= 0.0)
+        radiusRatio = lerp(_SparseRadiusRatio, 1.0, _Support[2 * i + 1]);
+    else if (_RepairSparseRadius != 0 && _Kern[b + 21] >= 0.0)
+    {
+        float t = saturate((_Kern[b + 21] - _SparseNeighborsMin) / (_SparseNeighborsMax - _SparseNeighborsMin));
+        radiusRatio = lerp(_SparseRadiusRatio, 1.0, t * t * (3.0 - 2.0 * t));
+    }
+    float radius = _Rho * radiusRatio;
+    float radius2 = _Rho2 * radiusRatio * radiusRatio;
+    float radiusPpu = _RhoPpu * radiusRatio;
     // camera-space K: M = R K R^T with R rows (right, up, -fwd); Sigma = rho^2 R K^2 R^T, Q = Sigma^-1 = R K^-2 R^T / rho^2
     float3 R0 = _Right, R1 = _Up, R2 = -_Fwd;
     float3 k0 = float3(_Kern[b + 3], _Kern[b + 4], _Kern[b + 5]);
     float3 k1 = float3(_Kern[b + 6], _Kern[b + 7], _Kern[b + 8]);
     float3 k2 = float3(_Kern[b + 9], _Kern[b + 10], _Kern[b + 11]);
     // A = rho * (R K): row a of A = rho * (R_a K) ;  Sigma_aa = |A_a|^2
-    float3 A0 = _Rho * float3(dot(R0, float3(k0.x, k1.x, k2.x)), dot(R0, float3(k0.y, k1.y, k2.y)), dot(R0, float3(k0.z, k1.z, k2.z)));
-    float3 A1 = _Rho * float3(dot(R1, float3(k0.x, k1.x, k2.x)), dot(R1, float3(k0.y, k1.y, k2.y)), dot(R1, float3(k0.z, k1.z, k2.z)));
+    float3 A0 = radius * float3(dot(R0, float3(k0.x, k1.x, k2.x)), dot(R0, float3(k0.y, k1.y, k2.y)), dot(R0, float3(k0.z, k1.z, k2.z)));
+    float3 A1 = radius * float3(dot(R1, float3(k0.x, k1.x, k2.x)), dot(R1, float3(k0.y, k1.y, k2.y)), dot(R1, float3(k0.z, k1.z, k2.z)));
     float sxx = dot(A0, A0), syy = dot(A1, A1);
     float3 i0 = float3(_Kern[b + 12], _Kern[b + 13], _Kern[b + 14]);
     float3 i1 = float3(_Kern[b + 15], _Kern[b + 16], _Kern[b + 17]);
@@ -243,18 +281,21 @@ void Project(uint3 id : SV_DispatchThreadID)
     float3 t0 = float3(dot(i0, R0), dot(i1, R0), dot(i2, R0));
     float3 t1 = float3(dot(i0, R1), dot(i1, R1), dot(i2, R1));
     float3 t2 = float3(dot(i0, R2), dot(i1, R2), dot(i2, R2));
-    float ir2 = 1.0 / _Rho2;
+    float ir2 = 1.0 / radius2;
     float q00 = dot(R0, t0) * ir2, q01 = dot(R0, t1) * ir2, q02 = dot(R0, t2) * ir2;
     float q11 = dot(R1, t1) * ir2, q12 = dot(R1, t2) * ir2, q22 = dot(R2, t2) * ir2;
 
-    float rSph = _RhoPpu / dc;
-    float rsDraw = clamp(rSph, _MinRpx, _SphMaxRpx);
+    float rSph = radiusPpu / dc;
+    float rsDraw = clamp(rSph, _MinRpx, _SphMaxRpx * radiusRatio);
     float halfpx = sqrt(max(max(sxx, syy), 0.0)) * _Ppu / dc;
     halfpx = iso ? rsDraw : clamp(halfpx, _MinRpx, _MaxRpx);
     bool on = (pxf + halfpx > 0.0) && (pxf - halfpx < (float)_Wpx) && (pyf + halfpx > 0.0) && (pyf - halfpx < (float)_Hpx);
     _Proj[o + 0] = pxf; _Proj[o + 1] = pyf; _Proj[o + 2] = dc; _Proj[o + 3] = halfpx; _Proj[o + 4] = rsDraw;
     _Proj[o + 5] = q00; _Proj[o + 6] = q01; _Proj[o + 7] = q02; _Proj[o + 8] = q11; _Proj[o + 9] = q12; _Proj[o + 10] = q22;
     _Proj[o + 11] = iso ? 1.0 : 0.0;
+    _Proj[o + 12] = radius2;
+    _Proj[o + 14] = 1.0 / (radiusRatio * radiusRatio * radiusRatio);
+    _Proj[o + 15] = radiusRatio;
     _Proj[o + 13] = on ? 1.0 : 0.0;
 }
 
@@ -316,7 +357,7 @@ void Raster(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         {   // splat_render_v2's sphere, bit for bit: s2 = rho2 (dc/ppu)^2, d = dc - sqrt(max(r^2 - s2, 0))
             inside = rho2 < rs2;
             float s2 = rho2 * sc2;
-            float hh = sqrt(max(_Rho2 - s2, 0.0));
+            float hh = sqrt(max(_Proj[o + 12] - s2, 0.0));
             d = dc - hh;
             dBack = dc + hh;
             chord = 2.0 * hh;
@@ -341,7 +382,7 @@ void Raster(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         if (_ThickMode == 0) InterlockedMax(_BackKey[pix], FloatToKey(dBack));
         else
         {
-            uint tq = (uint)(chord * _ThickPerM * 1.0e6 + 0.5);
+            uint tq = (uint)(chord * _ThickPerM * _Proj[o + 14] * 1.0e6 + 0.5);
             if (tq > 0u) InterlockedAdd(_ThickFix[pix], tq);
         }
     }

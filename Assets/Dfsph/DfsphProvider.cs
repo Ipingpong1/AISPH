@@ -4,8 +4,10 @@
 // Scene: a SPlisHSPlasH scene JSON (the corpus format; `scenePath`, absolute or relative to the project folder) — fluid
 // blocks, volume-map rigid bodies on analytic primitives, every DFSPH / CFL / viscosity parameter — so a corpus scene runs
 // here with the reference's configuration. Unity props in `obstacles` (LiveSphProvider.Obstacle, the GpuSphProvider
-// convention: unit primitives, transform scale shapes them) are added as KINEMATIC volume-map bodies: pose and velocity
-// are updated once per rendered frame.
+// convention: unit primitives, transform scale shapes them) are added as KINEMATIC volume-map bodies. Once per rendered
+// frame each prop is swept from its solver pose toward its transform over that frame's steps (pose + velocity uploaded
+// before every step), at most propMaxStepRadii particle radii per step: a once-per-frame jump of a fast prop lands
+// particles deep inside its volume map and blows the solve up.
 //
 // Pacing: dt is chosen on the GPU (CFL), so the CPU does not know it when it records. Each rendered frame records
 // round((simClock - tEstimate) / dtEstimate) steps (<= maxStepsPerFrame); the async-read stats ring corrects tEstimate
@@ -26,6 +28,8 @@ public class DfsphProvider : ParticleFrameProvider, IGpuSimSource
     public ComputeShader dfsphCompute;
     [Tooltip("SPlisHSPlasH scene JSON (absolute, or relative to the Unity project folder). Empty = the built-in TC_V-like dam break.")]
     public string scenePath = "Assets/Dfsph/Scenes/tcv_pilot_0000.json";
+    [Tooltip("Optional embedded scene JSON, preferred over Scene Path. Use this for portable player builds.")]
+    public TextAsset sceneAsset;
     public int maxParticles = 65536;
     [Tooltip("Scene-file sphere / torus bodies use the corpus' tessellated stock meshes (exact SPlisHSPlasH geometry). Off = analytic primitives (up to ~7 mm larger). Props are always analytic.")]
     public bool corpusTessellation = true;
@@ -48,12 +52,19 @@ public class DfsphProvider : ParticleFrameProvider, IGpuSimSource
     public LiveSphProvider.Obstacle[] obstacles;
     [Tooltip("Volume-map resolution of the prop maps (the corpus used 20^3 for obstacles).")]
     public Vector3Int propMapResolution = new Vector3Int(20, 20, 20);
+    [Tooltip("Largest prop surface displacement per solver step, in particle radii (0.8 = the reference CFL bound 0.4 x diameter at cflFactor 1). A faster prop lags its transform and catches up over the next frames.")]
+    public float propMaxStepRadii = 0.8f;
+    [Tooltip("Reset the fluid when the solve diverges: non-finite step stats, or max |v| above this (m/s). 0 = only non-finite.")]
+    public float divergenceResetSpeed = 60f;
 
     DfsphSolver solver;
     DfsphScene scene;
     int sceneBodyCount;
     readonly List<Vector3> propScaleKey = new List<Vector3>();
-    readonly List<Matrix4x4> propPrevPose = new List<Matrix4x4>();
+    readonly List<Matrix4x4> propPrevPose = new List<Matrix4x4>();   // per obstacle: the pose the solver has (end of the last sweep)
+    struct PropSweep { public int body, obstacle; public Vector3 t0, t1; public Quaternion q0, q1; }
+    readonly List<PropSweep> sweeps = new List<PropSweep>();
+    bool divergedLogged;
     float simClock, tEst, dtEst, nextFrameT, solverTime;
     long stepsRecorded, stepsKnown;
     int solverFrameIdx;
@@ -113,11 +124,16 @@ public class DfsphProvider : ParticleFrameProvider, IGpuSimSource
 
     void EnsureInit()
     {
-        if (inited) return;
+        // Unity preserves managed fields on a script reload, but the solver owns
+        // native GPU resources and cannot be restored by Unity serialization.
+        if (inited && solver != null) return;
         inited = true;
+        readbackPending = false;
         string path = ResolvePath(scenePath);
-        scene = path != null && File.Exists(path) ? DfsphScene.FromFile(path) : DefaultScene();
-        if (path != null && !File.Exists(path)) Debug.LogWarning($"DfsphProvider: scene '{scenePath}' not found — using the built-in TC_V default");
+        scene = sceneAsset != null ? DfsphScene.Parse(sceneAsset.text)
+            : path != null && File.Exists(path) ? DfsphScene.FromFile(path) : DefaultScene();
+        if (sceneAsset != null) scene.source = sceneAsset.name;
+        if (sceneAsset == null && path != null && !File.Exists(path)) Debug.LogWarning($"DfsphProvider: scene '{scenePath}' not found — using the built-in TC_V default");
         foreach (var u in scene.unsupported) Debug.LogWarning($"DfsphProvider: not reproduced: {u}");
         scene.SetTessellated(corpusTessellation);
         if (dfsphCompute == null) dfsphCompute = Resources.Load<ComputeShader>("Dfsph");
@@ -205,50 +221,78 @@ public class DfsphProvider : ParticleFrameProvider, IGpuSimSource
         }
     }
 
-    /// <summary>Once per rendered frame: move the prop bodies (pose + velocity); rebuild their maps if a scale changed.</summary>
-    void UpdateProps(float frameDt)
+    static Quaternion Rot(Matrix4x4 R) => Quaternion.LookRotation(R.GetColumn(2), R.GetColumn(1));
+
+    /// <summary>Once per rendered frame, before its steps: read the prop transforms and plan each prop's sweep from its
+    /// solver pose toward its transform (at most propMaxStepRadii particle radii per step). Rebuilds the prop maps when
+    /// a scale or an active state changed. teleport: jump straight to the transforms with zero velocity.</summary>
+    void PlanProps(int steps, bool teleport)
     {
+        sweeps.Clear();
         if (obstacles == null || obstacles.Length == 0) return;
         bool rebuild = false;
-        var bodies = solver.Bodies;
         int bi = sceneBodyCount;
+        float maxMove = Mathf.Max(1, steps) * propMaxStepRadii * scene.particleRadius;
         for (int s = 0; s < obstacles.Length && s < propScaleKey.Count; s++)
         {
             var o = obstacles[s];
-            if (o == null) continue;
-            if (!o.started && o.transform != null) { o.startPos = o.transform.position; o.started = true; }
-            Vector3 moved = o.transform != null ? LiveSphProvider.MotionOffset(o, solverTime) : Vector3.zero;
+            if (o != null && !o.started && o.transform != null) { o.startPos = o.transform.position; o.started = true; }
+            Vector3 moved = o != null && o.transform != null ? LiveSphProvider.MotionOffset(o, solverTime) : Vector3.zero;
             if (moved != Vector3.zero) o.transform.position = o.startPos + moved;
-            if (!PropPose(o, out var R, out var t, out var S)) continue;
-            if (propScaleKey[s] == Vector3.zero || (S - propScaleKey[s]).sqrMagnitude > 1e-10f) { rebuild = true; break; }
-            if (bi >= bodies.Count) break;
-            var b = bodies[bi++];
+            bool has = propScaleKey[s] != Vector3.zero;                      // AddProps gave this obstacle a body
+            if (!PropPose(o, out var R, out var t, out var S)) { if (has) { rebuild = true; break; } continue; }
+            if (!has || (S - propScaleKey[s]).sqrMagnitude > 1e-10f) { rebuild = true; break; }
+            if (bi >= solver.Bodies.Count) break;
             var prev = propPrevPose[s];
-            Vector3 tPrev = prev.GetColumn(3);
-            b.linearVelocity = frameDt > 0f ? (t - tPrev) / frameDt : Vector3.zero;
-            Matrix4x4 dR = R * prev.transpose; dR.SetColumn(3, new Vector4(0, 0, 0, 1)); dR.SetRow(3, new Vector4(0, 0, 0, 1));
-            b.angularVelocity = frameDt > 0f ? AxisAngle(dR) / frameDt : Vector3.zero;
-            b.moving = b.linearVelocity.sqrMagnitude > 0f || b.angularVelocity.sqrMagnitude > 0f;
-            b.translation = t; b.rotationMatrix = R; b.useRotationMatrix = true;
-            var pose = R; pose.SetColumn(3, new Vector4(t.x, t.y, t.z, 1f));
-            propPrevPose[s] = pose;
+            var w = new PropSweep { body = bi++, obstacle = s, t0 = prev.GetColumn(3), q0 = Rot(prev), t1 = t, q1 = Rot(R) };
+            if (teleport) { w.t0 = w.t1; w.q0 = w.q1; }
+            // limit the largest surface displacement (translation, or rotation at the body's reach) to maxMove
+            float reach = Mathf.Max(solver.Bodies[w.body].MaxDist(), 1e-3f);
+            float need = Mathf.Max((w.t1 - w.t0).magnitude, Quaternion.Angle(w.q0, w.q1) * Mathf.Deg2Rad * reach);
+            if (need > maxMove)
+            {
+                float f = maxMove / need;
+                w.t1 = Vector3.Lerp(w.t0, w.t1, f);
+                w.q1 = Quaternion.Slerp(w.q0, w.q1, f);
+            }
+            sweeps.Add(w);
+            var end = Matrix4x4.Rotate(w.q1); end.SetColumn(3, new Vector4(w.t1.x, w.t1.y, w.t1.z, 1f));
+            propPrevPose[s] = end;
         }
         if (rebuild)
         {
+            sweeps.Clear();
             var all = new List<DfsphSolver.Body>(scene.bodies);
             AddProps(all);
             solver.SetBodies(all);
         }
-        else solver.UploadBodies();
     }
 
-    static Vector3 AxisAngle(Matrix4x4 R)
+    /// <summary>Pose step k (0-based) of `steps` of the planned sweeps, with the sweep's velocity, and upload it.</summary>
+    void ApplyPropStep(int k, int steps)
     {
-        float tr = R.m00 + R.m11 + R.m22;
-        float ang = Mathf.Acos(Mathf.Clamp((tr - 1f) * 0.5f, -1f, 1f));
-        if (ang < 1e-6f) return Vector3.zero;
-        var axis = new Vector3(R.m21 - R.m12, R.m02 - R.m20, R.m10 - R.m01) / (2f * Mathf.Sin(ang));
-        return axis.normalized * ang;
+        if (sweeps.Count == 0) return;
+        var bodies = solver.Bodies;
+        float a = (k + 1f) / Mathf.Max(1, steps);
+        float span = Mathf.Max(1, steps) * Mathf.Max(dtEst, 1e-5f);        // sim time the sweep takes
+        foreach (var w in sweeps)
+        {
+            var b = bodies[w.body];
+            b.translation = Vector3.Lerp(w.t0, w.t1, a);
+            b.rotationMatrix = Matrix4x4.Rotate(Quaternion.Slerp(w.q0, w.q1, a)); b.useRotationMatrix = true;
+            b.linearVelocity = (w.t1 - w.t0) / span;
+            (w.q1 * Quaternion.Inverse(w.q0)).ToAngleAxis(out float deg, out Vector3 axis);
+            if (deg > 180f) deg -= 360f;
+            b.angularVelocity = Mathf.Abs(deg) > 1e-4f && float.IsFinite(axis.x) ? axis * (deg * Mathf.Deg2Rad / span) : Vector3.zero;
+            b.moving = b.linearVelocity.sqrMagnitude > 0f || b.angularVelocity.sqrMagnitude > 0f;
+        }
+        solver.UploadBodiesOrdered();
+    }
+
+    bool SweepsMove()
+    {
+        foreach (var w in sweeps) if (w.t0 != w.t1 || w.q0 != w.q1) return true;
+        return false;
     }
 
     // ---------- stepping ----------
@@ -257,12 +301,15 @@ public class DfsphProvider : ParticleFrameProvider, IGpuSimSource
         EnsureInit();
         PollStats();
         if (dt <= 0f || solver.Count == 0) return;
+        if (!float.IsFinite(tEst) || !float.IsFinite(dtEst)) { Diverged("non-finite time estimate"); return; }
         simClock = Mathf.Min(simClock + dt, tEst + 0.25f);       // drop time when hopelessly behind
         int steps = Mathf.Clamp(Mathf.FloorToInt((simClock - tEst) / Mathf.Max(dtEst, 1e-5f)), 0, maxStepsPerFrame);
         if (steps == 0) return;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        UpdateProps(dt);
-        solver.ExecuteSteps(steps);
+        PlanProps(steps, false);
+        if (SweepsMove())
+            for (int k = 0; k < steps; k++) { ApplyPropStep(k, steps); solver.ExecuteSteps(1); }
+        else { ApplyPropStep(steps - 1, steps); solver.ExecuteSteps(steps); }   // still props: pose, zero velocity
         stepsRecorded += steps;
         tEst += steps * dtEst;
         solverTime = tEst;
@@ -315,6 +362,9 @@ public class DfsphProvider : ParticleFrameProvider, IGpuSimSource
         }
         last = DfsphSolver.DecodeStats(ring, best);
         stepsKnown = last.step;
+        if (!float.IsFinite(last.t) || !float.IsFinite(last.dtNew) || !float.IsFinite(last.vmax) ||
+            (divergenceResetSpeed > 0f && last.vmax > divergenceResetSpeed))
+        { Diverged($"step {last.step}: max |v| {last.vmax:G3} m/s, dt {last.dtNew:G3} s"); return; }
         bool newTrunc = last.trunc > truncSeen || last.truncV > truncVSeen;
         truncSeen = last.trunc; truncVSeen = last.truncV;
         if (newTrunc && !exactIterations)
@@ -371,6 +421,23 @@ public class DfsphProvider : ParticleFrameProvider, IGpuSimSource
         EnsureInit();
         solver.Reset();
         Spawn();
+    }
+
+    /// <summary>Accept an instantaneous gameplay reset without treating the pose jump as obstacle velocity.</summary>
+    public void SyncPropsAfterTeleport()
+    {
+        EnsureInit();
+        PlanProps(1, true);
+        ApplyPropStep(0, 1);
+    }
+
+    /// <summary>The solve blew up (a prop moved through the fluid faster than it can respond, or worse): particles
+    /// escape the tank and keep accelerating, which pins the CFL dt at its minimum and freezes the sim. Respawn.</summary>
+    void Diverged(string why)
+    {
+        if (!divergedLogged) Debug.LogError($"DfsphProvider: the solve diverged ({why}) — resetting the fluid. Further resets are not logged.");
+        divergedLogged = true;
+        ResetSim();
     }
 
     public string StatusLine()
